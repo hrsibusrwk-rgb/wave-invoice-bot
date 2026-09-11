@@ -2,102 +2,144 @@ const { Telegraf } = require('telegraf');
 const axios = require('axios');
 
 // ==================== 配置区 ====================
-const TELEGRAM_BOT_TOKEN = "8957889878:AAGsOwGMnv8dNiSa22Bsl1VbYCAgdzohbNU"; // 换成你的 Token
-const WAVE_TOKEN = "wwkkCMFu43erTAzgYEqh8QpyraR9hw";
-const WAVE_BUSINESS_ID = "QnVzaW5lc3M6NTYxOWUxNzYtMDNiNi00NjBjLWI0YzItMjY0YTJlZTk4MTdm";
+const TELEGRAM_BOT_TOKEN = "8957889878:AAGsOwGMnv8dNiSa22Bsl1VbYCAgdzohbNU"; 
 const WAVE_GRAPHQL_URL = "https://gql.waveapps.com/graphql/public";
 
-// 初始化 Telegram 机器人
+// 在这里配置你的多账号列表（每个账号有独立的 token 和 businessId）
+const WAVE_ACCOUNTS = [
+    {
+        name: "Company A", // 随便起个名字方便自己辨认
+        businessId: "BShYHGI-JLVa9PcPvw311D_48dQ2a54onv2Isvfw",
+        token: "O1bIO4eiS7otNo8JAUwOcCUfFv1wLv"
+    },
+    {
+        name: "Company B",
+        businessId: "F8Ac4.DfkbU.RpLXYPaKnQ4hv3YpdQWiz5Ill_ZT",
+        token: "CuF67Ugju7HR0w4UU9x41p9IeKpYdj"
+    }
+];
+
 const bot = new Telegraf(TELEGRAM_BOT_TOKEN);
 
-// 查询 Wave 发票的函数（已包含发票日期 invoiceDate）
-async function searchWaveInvoice(keyword) {
-    const query = `
-    query($businessId: ID!) {
-        business(id: $businessId) {
-            invoices(page: 1, pageSize: 30) {
-                edges {
-                    node {
-                        invoiceNumber
-                        invoiceDate
-                        viewUrl
-                        amountDue { value }
-                        customer { name }
+async function searchWaveInvoice(keywordInput) {
+    const keywords = keywordInput.toLowerCase().trim().split(/\s+/).filter(Boolean);
+    let allMatched = [];
+
+    // 针对每个独立的 Wave 账号分别发起请求
+    const promises = WAVE_ACCOUNTS.map(async (acc) => {
+        const query = `
+        query($businessId: ID!) {
+            business(id: $businessId) {
+                invoices(page: 1, pageSize: 50) {
+                    edges {
+                        node {
+                            invoiceNumber
+                            invoiceDate
+                            paidDate
+                            status
+                            viewUrl
+                            amountDue { value }
+                            customer { name }
+                        }
                     }
                 }
             }
         }
-    }
-    `;
+        `;
 
-    try {
-        const response = await axios.post(WAVE_GRAPHQL_URL, {
-            query: query,
-            variables: { businessId: WAVE_BUSINESS_ID }
-        }, {
-            headers: {
-                "Authorization": `Bearer ${WAVE_TOKEN}`,
-                "Content-Type": "application/json"
+        try {
+            const response = await axios.post(WAVE_GRAPHQL_URL, {
+                query: query,
+                variables: { businessId: acc.businessId }
+            }, {
+                headers: {
+                    "Authorization": `Bearer ${acc.token}`,
+                    "Content-Type": "application/json"
+                }
+            });
+
+            // 检查接口返回是否包含数据
+            if (!response.data || !response.data.data || !response.data.data.business) {
+                console.error(`Invalid response for ${acc.name}:`, response.data);
+                return [];
             }
-        });
 
-        const invoices = response.data.data.business.invoices.edges;
-        let matched = [];
-        const kw = keyword.toLowerCase().trim();
+            const invoices = response.data.data.business.invoices.edges;
+            const matched = [];
 
-        for (let edge of invoices) {
-            const inv = edge.node;
-            const invNum = String(inv.invoiceNumber || '').toLowerCase();
-            const custName = inv.customer.name.toLowerCase();
-            const amount = String(inv.amountDue.value);
+            for (let edge of invoices) {
+                const inv = edge.node;
+                const invNum = String(inv.invoiceNumber || '').toLowerCase();
+                const custName = inv.customer.name.toLowerCase();
+                const amount = String(inv.amountDue.value || '').toLowerCase();
+                const status = String(inv.status || '').toLowerCase();
+                const invoiceDate = String(inv.invoiceDate || '').toLowerCase();
+                const paidDate = String(inv.paidDate || '').toLowerCase();
 
-            if (invNum.includes(kw) || custName.includes(kw) || amount.includes(kw)) {
-                matched.push({
-                    invoiceNumber: inv.invoiceNumber,
-                    invoiceDate: inv.invoiceDate,
-                    customerName: inv.customer.name,
-                    amount: amount,
-                    viewUrl: inv.viewUrl
-                });
+                const combinedFields = `${invNum} ${custName} ${amount} ${status} ${invoiceDate} ${paidDate}`;
+                const isMatchAll = keywords.every(kw => combinedFields.includes(kw));
+
+                if (isMatchAll) {
+                    matched.push({
+                        accountName: acc.name, // 标明是哪个公司的发票
+                        invoiceNumber: inv.invoiceNumber,
+                        invoiceDate: inv.invoiceDate,
+                        paidDate: inv.paidDate || 'N/A',
+                        status: inv.status,
+                        customerName: inv.customer.name,
+                        amount: amount,
+                        viewUrl: inv.viewUrl
+                    });
+                }
             }
+            return matched;
+        } catch (error) {
+            console.error(`Wave Search Error for ${acc.name}:`, error.response?.data || error.message);
+            return [];
         }
-        return matched;
-    } catch (error) {
-        console.error("Wave Search Error:", error.response?.data || error.message);
-        return [];
+    });
+
+    const resultsArrays = await Promise.all(promises);
+    for (const arr of resultsArrays) {
+        allMatched.push(...arr);
     }
+    
+    return allMatched;
 }
 
-// 英文欢迎语 /start
 bot.start((ctx) => {
-    ctx.reply("👋 Hello! I am your Wave Invoice Assistant.\n\nYou can search and resend invoices anytime using these commands:\n👉 `#resend [Company Name or Invoice No]`\n👉 `#find [Keyword]`");
+    ctx.reply("👋 Hello! Multi-Account Wave Assistant is ready.\n\n" +
+              "Search invoices across all independent accounts using spaces, e.g.:\n" +
+              "👉 `#resend abc 2026-06`\n" +
+              "👉 `#resend PAID`");
 });
 
-// 监听所有英文指令
 bot.on('text', async (ctx) => {
     const messageText = ctx.message.text;
 
-    // 支持 #resend 或 #find 指令
     if (messageText.startsWith('#resend') || messageText.startsWith('#find')) {
         const keyword = messageText.replace('#resend', '').replace('#find', '').trim();
         
         if (!keyword) {
-            await ctx.reply("⚠️ Please provide a keyword. Example: `#resend ABC` or `#resend 6`", { parse_mode: 'Markdown' });
+            await ctx.reply("⚠️ Please provide a keyword. Example: `#resend abc 2026-06`", { parse_mode: 'Markdown' });
             return;
         }
 
-        await ctx.reply(`🔍 Searching Wave for invoices matching "${keyword}"...`);
+        await ctx.reply(`🔍 Searching across all independent Wave accounts for: "${keyword}"...`);
 
         const results = await searchWaveInvoice(keyword);
 
         if (results.length === 0) {
-            await ctx.reply(`❌ No invoice records found for "${keyword}".`);
+            await ctx.reply(`❌ No invoice records found matching all conditions for "${keyword}".`);
         } else {
             let replyText = `🎉 **Found the following invoice(s):**\n`;
             results.forEach((inv) => {
                 replyText += `\n-------------------\n` +
+                             `🏢 **Account:** ${inv.accountName}\n` +
                              `📄 **Invoice No:** #${inv.invoiceNumber}\n` +
-                             `📅 **Date:** ${inv.invoiceDate}\n` +
+                             `🏷️ **Status:** ${inv.status}\n` +
+                             `📅 **Invoice Date:** ${inv.invoiceDate}\n` +
+                             `💳 **Paid Date:** ${inv.paidDate}\n` +
                              `👤 **Customer:** ${inv.customerName}\n` +
                              `💰 **Amount:** RM${inv.amount}\n` +
                              `🔗 **View Link:** ${inv.viewUrl}\n`;
@@ -107,9 +149,8 @@ bot.on('text', async (ctx) => {
     }
 });
 
-// 启动机器人
 bot.launch();
-console.log('✅ Telegram Bot successfully started and online (English Version)!');
+console.log('✅ Telegram Bot successfully started and online (Multi-Account Version)!');
 
 process.once('SIGINT', () => bot.stop('SIGINT'));
 process.once('SIGTERM', () => bot.stop('SIGTERM'));
