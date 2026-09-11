@@ -10,12 +10,12 @@ const WAVE_GRAPHQL_URL = "https://gql.waveapps.com/graphql/public";
 const WAVE_ACCOUNTS = [
     {
         name: "Company A",
-        businessId: "BShYHGI-JLVa9PcPvw311D_48dQ2a54onv2Isvfw",
+        businessId: "2b98dbb6-ad83-49c9-b0e1-a534bfa9520d",
         token: "O1bIO4eiS7otNo8JAUwOcCUfFv1wLv"
     },
     {
         name: "Company B",
-        businessId: "F8Ac4.DfkbU.RpLXYPaKnQ4hv3YpdQWiz5Ill_ZT",
+        businessId: "5696cb16-fa6b-4613-af43-bfc23f4086f7",
         token: "CuF67Ugju7HR0w4UU9x41p9IeKpYdj"
     }
 ];
