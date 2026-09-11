@@ -30,16 +30,21 @@ async function searchWaveInvoice(keywordInput) {
         const query = `
         query($businessId: ID!) {
             business(id: $businessId) {
+                id
+                name
                 invoices(page: 1, pageSize: 50) {
                     edges {
                         node {
                             invoiceNumber
                             invoiceDate
-                            paidDate
+                            amountDue {
+                                value
+                            }
                             status
                             viewUrl
-                            amountDue { value }
-                            customer { name }
+                            customer {
+                                name
+                            }
                         }
                     }
                 }
@@ -48,7 +53,6 @@ async function searchWaveInvoice(keywordInput) {
         `;
 
         try {
-            // 调试日志：打印当前请求的公司名称与 ID
             console.log(`[Wave Debug] 正在请求公司: ${acc.name}, Business ID: ${acc.businessId}`);
 
             const response = await axios.post(WAVE_GRAPHQL_URL, {
@@ -61,7 +65,6 @@ async function searchWaveInvoice(keywordInput) {
                 }
             });
 
-            // 调试日志：确认请求成功
             console.log(`[Wave Debug] ${acc.name} 请求成功，状态码: ${response.status}`);
 
             if (!response.data || !response.data.data || !response.data.data.business) {
@@ -75,13 +78,12 @@ async function searchWaveInvoice(keywordInput) {
             for (let edge of invoices) {
                 const inv = edge.node;
                 const invNum = String(inv.invoiceNumber || '').toLowerCase();
-                const custName = inv.customer.name.toLowerCase();
-                const amount = String(inv.amountDue.value || '').toLowerCase();
+                const custName = inv.customer && inv.customer.name ? inv.customer.name.toLowerCase() : '';
+                const amount = inv.amountDue && inv.amountDue.value ? String(inv.amountDue.value).toLowerCase() : '';
                 const status = String(inv.status || '').toLowerCase();
                 const invoiceDate = String(inv.invoiceDate || '').toLowerCase();
-                const paidDate = String(inv.paidDate || '').toLowerCase();
 
-                const combinedFields = `${invNum} ${custName} ${amount} ${status} ${invoiceDate} ${paidDate}`;
+                const combinedFields = `${invNum} ${custName} ${amount} ${status} ${invoiceDate}`;
                 const isMatchAll = keywords.every(kw => combinedFields.includes(kw));
 
                 if (isMatchAll) {
@@ -89,9 +91,9 @@ async function searchWaveInvoice(keywordInput) {
                         accountName: acc.name,
                         invoiceNumber: inv.invoiceNumber,
                         invoiceDate: inv.invoiceDate,
-                        paidDate: inv.paidDate || 'N/A',
+                        paidDate: 'N/A',
                         status: inv.status,
-                        customerName: inv.customer.name,
+                        customerName: inv.customer ? inv.customer.name : 'N/A',
                         amount: amount,
                         viewUrl: inv.viewUrl
                     });
@@ -141,7 +143,6 @@ bot.on('text', async (ctx) => {
                              `📄 **Invoice No:** #${inv.invoiceNumber}\n` +
                              `🏷️ **Status:** ${inv.status}\n` +
                              `📅 **Invoice Date:** ${inv.invoiceDate}\n` +
-                             `💳 **Paid Date:** ${inv.paidDate}\n` +
                              `👤 **Customer:** ${inv.customerName}\n` +
                              `💰 **Amount:** RM${inv.amount}\n` +
                              `🔗 **View Link:** ${inv.viewUrl}\n`;
