@@ -1,14 +1,15 @@
 const { Telegraf } = require('telegraf');
 const axios = require('axios');
+const http = require('http'); // 引入内置的 http 模块来满足 Render 端口要求
 
 // ==================== 配置区 ====================
 const TELEGRAM_BOT_TOKEN = "8957889878:AAGsOwGMnv8dNiSa22Bsl1VbYCAgdzohbNU"; 
 const WAVE_GRAPHQL_URL = "https://gql.waveapps.com/graphql/public";
 
-// 在这里配置你的多账号列表（每个账号有独立的 token 和 businessId）
+// 在这里配置你的多账号列表
 const WAVE_ACCOUNTS = [
     {
-        name: "Company A", // 随便起个名字方便自己辨认
+        name: "Company A",
         businessId: "BShYHGI-JLVa9PcPvw311D_48dQ2a54onv2Isvfw",
         token: "O1bIO4eiS7otNo8JAUwOcCUfFv1wLv"
     },
@@ -25,7 +26,6 @@ async function searchWaveInvoice(keywordInput) {
     const keywords = keywordInput.toLowerCase().trim().split(/\s+/).filter(Boolean);
     let allMatched = [];
 
-    // 针对每个独立的 Wave 账号分别发起请求
     const promises = WAVE_ACCOUNTS.map(async (acc) => {
         const query = `
         query($businessId: ID!) {
@@ -58,9 +58,7 @@ async function searchWaveInvoice(keywordInput) {
                 }
             });
 
-            // 检查接口返回是否包含数据
             if (!response.data || !response.data.data || !response.data.data.business) {
-                console.error(`Invalid response for ${acc.name}:`, response.data);
                 return [];
             }
 
@@ -81,7 +79,7 @@ async function searchWaveInvoice(keywordInput) {
 
                 if (isMatchAll) {
                     matched.push({
-                        accountName: acc.name, // 标明是哪个公司的发票
+                        accountName: acc.name,
                         invoiceNumber: inv.invoiceNumber,
                         invoiceDate: inv.invoiceDate,
                         paidDate: inv.paidDate || 'N/A',
@@ -108,10 +106,7 @@ async function searchWaveInvoice(keywordInput) {
 }
 
 bot.start((ctx) => {
-    ctx.reply("👋 Hello! Multi-Account Wave Assistant is ready.\n\n" +
-              "Search invoices across all independent accounts using spaces, e.g.:\n" +
-              "👉 `#resend abc 2026-06`\n" +
-              "👉 `#resend PAID`");
+    ctx.reply("👋 Hello! Multi-Account Wave Assistant is ready.");
 });
 
 bot.on('text', async (ctx) => {
@@ -150,7 +145,16 @@ bot.on('text', async (ctx) => {
 });
 
 bot.launch();
-console.log('✅ Telegram Bot successfully started and online (Multi-Account Version)!');
+console.log('✅ Telegram Bot successfully started and online!');
+
+// 启动一个微型 HTTP 服务器，专门用来通过 Render 的端口扫描，并响应 UptimeRobot 的 ping 唤醒
+const PORT = process.env.PORT || 3000;
+http.createServer((req, res) => {
+    res.writeHead(200, { 'Content-Type': 'text/plain' });
+    res.end('Bot is alive and running!');
+}).listen(PORT, () => {
+    console.log(`HTTP server is listening on port ${PORT}`);
+});
 
 process.once('SIGINT', () => bot.stop('SIGINT'));
 process.once('SIGTERM', () => bot.stop('SIGTERM'));
