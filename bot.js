@@ -20,22 +20,33 @@ const WAVE_ACCOUNTS = [
     }
 ];
 
-// 每页拉多少张发票
+// 每页拉多少条记录
 const PAGE_SIZE = 50;
-// 单个公司最多翻多少页，防止发票超多时无限翻页
-// 1000 页 * 50 张/页 = 最多抓 50000 张发票
+// 单次翻页最多翻多少页，防止数据超多时无限翻页
+// 1000 页 * 50 张/页 = 最多抓 50000 条
 const MAX_PAGES_PER_ACCOUNT = 1000;
 // 拿到第 1 页、确认总页数之后，剩下的页数几个一批并发抓取，加快速度
-const FETCH_CONCURRENCY = 5;
+// Wave API 有限速，并发太高会被 429/RATE_LIMITED 拒绝，2 是比较稳的数字
+const FETCH_CONCURRENCY = 2;
+// 单页被限速时最多重试几次，超过就放弃这一页
+const MAX_RETRIES_PER_PAGE = 5;
+// 关键字匹配到的客户数超过这个数，就不逐个按客户筛了（大概率不是在搜具体某个客户），直接整表/按日期扫
+const MAX_MATCHED_CUSTOMERS_FOR_FILTER = 20;
+// 客户列表缓存多久（客户变动不频繁，不用每次搜索都重新拉一次）
+const CUSTOMER_CACHE_TTL_MS = 10 * 60 * 1000; // 10 分钟
+
+function sleep(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+}
 
 const bot = new Telegraf(TELEGRAM_BOT_TOKEN);
 
+// invoices 支持 customerId / invoiceDateStart / invoiceDateEnd 等参数做服务器端筛选，
+// 不传（undefined -> null）就等于不筛，跟以前整表扫的行为一样
 const INVOICES_QUERY = `
-query($businessId: ID!, $page: Int!, $pageSize: Int!) {
+query($businessId: ID!, $page: Int!, $pageSize: Int!, $customerId: ID, $invoiceDateStart: Date, $invoiceDateEnd: Date) {
     business(id: $businessId) {
-        id
-        name
-        invoices(page: $page, pageSize: $pageSize) {
+        invoices(page: $page, pageSize: $pageSize, customerId: $customerId, invoiceDateStart: $invoiceDateStart, invoiceDateEnd: $invoiceDateEnd) {
             pageInfo {
                 currentPage
                 totalPages
@@ -64,13 +75,32 @@ query($businessId: ID!, $page: Int!, $pageSize: Int!) {
 }
 `;
 
-// 请求某个公司账号的某一页发票
-async function fetchInvoicePage(acc, page) {
-    console.log(`[Wave Debug] 正在请求公司: ${acc.name}, Business ID: ${acc.businessId}, 第 ${page} 页`);
+const CUSTOMERS_QUERY = `
+query($businessId: ID!, $page: Int!, $pageSize: Int!) {
+    business(id: $businessId) {
+        customers(page: $page, pageSize: $pageSize) {
+            pageInfo {
+                currentPage
+                totalPages
+            }
+            edges {
+                node {
+                    id
+                    name
+                }
+            }
+        }
+    }
+}
+`;
+
+// 请求某一页数据（发票或客户，由传进来的 query/variables 决定）；遇到 Wave 的限速会自动等待后重试
+async function graphqlRequestWithRetry(acc, label, queryString, variables, page, attempt = 1) {
+    console.log(`[Wave Debug] 正在请求公司: ${acc.name} (${label}), 第 ${page} 页${attempt > 1 ? ` (第 ${attempt} 次尝试)` : ''}`);
 
     const response = await axios.post(WAVE_GRAPHQL_URL, {
-        query: INVOICES_QUERY,
-        variables: { businessId: acc.businessId, page: page, pageSize: PAGE_SIZE }
+        query: queryString,
+        variables: variables
     }, {
         headers: {
             "Authorization": `Bearer ${acc.token}`,
@@ -78,43 +108,62 @@ async function fetchInvoicePage(acc, page) {
         }
     });
 
-    console.log(`[Wave Debug] ${acc.name} 第 ${page} 页请求成功，状态码: ${response.status}`);
+    console.log(`[Wave Debug] ${acc.name} (${label}) 第 ${page} 页请求成功，状态码: ${response.status}`);
+
+    const rateLimitError = response.data.errors?.find(e => e.extensions?.code === 'RATE_LIMITED');
+
+    if (rateLimitError) {
+        if (attempt >= MAX_RETRIES_PER_PAGE) {
+            console.log(`[Wave Debug] ${acc.name} (${label}) 第 ${page} 页被限速 ${attempt} 次后放弃`);
+            return { business: null, gaveUp: true };
+        }
+
+        const resetAtMs = rateLimitError.extensions?.resetAt ? new Date(rateLimitError.extensions.resetAt).getTime() : NaN;
+        const waitMs = Number.isFinite(resetAtMs)
+            ? Math.max(resetAtMs - Date.now(), 300) + 300 // 多留 300ms 缓冲
+            : 1000 * attempt; // 拿不到 resetAt 就用简单的递增等待兜底
+
+        console.log(`[Wave Debug] ${acc.name} (${label}) 第 ${page} 页被限速，等待 ${waitMs}ms 后重试`);
+        await sleep(waitMs);
+        return graphqlRequestWithRetry(acc, label, queryString, variables, page, attempt + 1);
+    }
 
     if (response.data.errors) {
-        console.log(`[Wave Debug] ${acc.name} 第 ${page} 页 GraphQL 报错:`, JSON.stringify(response.data.errors));
+        console.log(`[Wave Debug] ${acc.name} (${label}) 第 ${page} 页 GraphQL 报错:`, JSON.stringify(response.data.errors));
     }
 
-    return response.data?.data?.business;
+    return { business: response.data?.data?.business, gaveUp: false };
 }
 
-// 拉取某个公司账号下的全部发票（自动翻页，翻到第 2 页起分批并发抓取加快速度）
-async function fetchAllInvoicesForAccount(acc) {
-    let allInvoices = [];
+// 通用翻页抓取：自动翻到最后一页，第 2 页起分批并发抓取
+async function fetchAllPages(acc, label, queryString, extraVars, getConnection) {
+    let allEdges = [];
 
-    // 先拿第 1 页，确认总页数
-    let firstBusiness;
+    let firstResult;
     try {
-        firstBusiness = await fetchInvoicePage(acc, 1);
+        firstResult = await graphqlRequestWithRetry(acc, label, queryString, { businessId: acc.businessId, page: 1, pageSize: PAGE_SIZE, ...extraVars }, 1);
     } catch (error) {
-        console.error(`Wave Search Error for ${acc.name} (page 1):`, error.response?.data || error.message);
-        return allInvoices;
+        console.error(`Wave Search Error for ${acc.name} (${label}, page 1):`, error.response?.data || error.message);
+        return allEdges;
     }
 
+    const firstBusiness = firstResult.business;
     if (!firstBusiness) {
-        console.log(`[Wave Debug] ${acc.name} 返回数据中未找到 business，可能 ID 或 Token 不匹配。`);
-        return allInvoices;
+        if (firstResult.gaveUp) {
+            console.log(`[Wave Debug] ${acc.name} (${label}) 第 1 页一直被限速，这次先放弃，等一下再搜应该就好了`);
+        } else {
+            console.log(`[Wave Debug] ${acc.name} (${label}) 返回数据中未找到 business，可能 ID 或 Token 不匹配。`);
+        }
+        return allEdges;
     }
 
-    allInvoices.push(...(firstBusiness.invoices?.edges || []));
+    const firstConn = getConnection(firstBusiness);
+    allEdges.push(...(firstConn?.edges || []));
 
-    const totalPages = Math.min(
-        firstBusiness.invoices?.pageInfo?.totalPages || 1,
-        MAX_PAGES_PER_ACCOUNT
-    );
+    const totalPages = Math.min(firstConn?.pageInfo?.totalPages || 1, MAX_PAGES_PER_ACCOUNT);
 
-    console.log(`[Wave Debug] ${acc.name} 第 1/${totalPages} 页，累计 ${allInvoices.length} 张`);
+    console.log(`[Wave Debug] ${acc.name} (${label}) 第 1/${totalPages} 页，累计 ${allEdges.length} 条`);
 
-    // 剩下的页数（2..totalPages）分批并发抓取
     let page = 2;
     while (page <= totalPages) {
         const batchPages = [];
@@ -124,22 +173,44 @@ async function fetchAllInvoicesForAccount(acc) {
 
         const batchResults = await Promise.all(batchPages.map(async (p) => {
             try {
-                const business = await fetchInvoicePage(acc, p);
-                return business?.invoices?.edges || [];
+                const result = await graphqlRequestWithRetry(acc, label, queryString, { businessId: acc.businessId, page: p, pageSize: PAGE_SIZE, ...extraVars }, p);
+                const conn = getConnection(result.business);
+                return conn?.edges || [];
             } catch (error) {
-                console.error(`Wave Search Error for ${acc.name} (page ${p}):`, error.response?.data || error.message);
+                console.error(`Wave Search Error for ${acc.name} (${label}, page ${p}):`, error.response?.data || error.message);
                 return [];
             }
         }));
 
         for (const edges of batchResults) {
-            allInvoices.push(...edges);
+            allEdges.push(...edges);
         }
 
-        console.log(`[Wave Debug] ${acc.name} 已抓到第 ${Math.min(page - 1, totalPages)}/${totalPages} 页，累计 ${allInvoices.length} 张`);
+        console.log(`[Wave Debug] ${acc.name} (${label}) 已抓到第 ${Math.min(page - 1, totalPages)}/${totalPages} 页，累计 ${allEdges.length} 条`);
     }
 
-    return allInvoices;
+    return allEdges;
+}
+
+// extraFilters 可以传 { customerId, invoiceDateStart, invoiceDateEnd } 让 Wave 直接筛，不传就是整表扫（跟以前一样）
+async function fetchAllInvoicesForAccount(acc, extraFilters = {}) {
+    return fetchAllPages(acc, 'invoices', INVOICES_QUERY, extraFilters, (business) => business?.invoices);
+}
+
+// 客户列表通常比发票少得多，缓存起来，避免每次搜索都重新拉一遍
+const customerCache = new Map(); // businessId -> { timestamp, customers: [{id, name}] }
+
+async function getCustomersForAccount(acc) {
+    const cached = customerCache.get(acc.businessId);
+    if (cached && (Date.now() - cached.timestamp) < CUSTOMER_CACHE_TTL_MS) {
+        return cached.customers;
+    }
+
+    const edges = await fetchAllPages(acc, 'customers', CUSTOMERS_QUERY, {}, (business) => business?.customers);
+    const customers = edges.map(e => e.node).filter(Boolean);
+    customerCache.set(acc.businessId, { timestamp: Date.now(), customers });
+    console.log(`[Wave Debug] ${acc.name} 客户列表已缓存，共 ${customers.length} 个客户`);
+    return customers;
 }
 
 // 把一些常见的口语化写法转成实际存在字段里的纯数字/文字，再去匹配
@@ -155,14 +226,67 @@ function normalizeKeyword(kw) {
     return kw;
 }
 
+// 识别关键字是不是"年份 / 年-月 / 完整日期"，是的话转成 Wave 能直接筛的日期范围
+function keywordToDateRange(kw) {
+    // 完整日期，比如 2026-04-14
+    if (/^\d{4}-\d{2}-\d{2}$/.test(kw)) {
+        return { invoiceDateStart: kw, invoiceDateEnd: kw };
+    }
+    // 年-月，比如 2026-04
+    if (/^\d{4}-\d{2}$/.test(kw)) {
+        const [y, m] = kw.split('-').map(Number);
+        const lastDay = new Date(y, m, 0).getDate(); // m 是 1-indexed 月份，Date(y, m, 0) 正好是该月最后一天
+        return { invoiceDateStart: `${kw}-01`, invoiceDateEnd: `${kw}-${String(lastDay).padStart(2, '0')}` };
+    }
+    // 整年，比如 2026（也是 "YE2026" 归一化之后的样子）
+    if (/^\d{4}$/.test(kw)) {
+        return { invoiceDateStart: `${kw}-01-01`, invoiceDateEnd: `${kw}-12-31` };
+    }
+    return null;
+}
+
 async function searchWaveInvoice(keywordInput) {
     const keywords = keywordInput.toLowerCase().trim().split(/\s+/).filter(Boolean).map(normalizeKeyword);
+
+    // 从关键字里找一个日期范围（年 / 年-月 / 完整日期），可以让 Wave 直接按日期筛
+    let dateRange = null;
+    for (const kw of keywords) {
+        const range = keywordToDateRange(kw);
+        if (range) {
+            dateRange = range;
+            break;
+        }
+    }
+
     let allMatched = [];
 
     const promises = WAVE_ACCOUNTS.map(async (acc) => {
-        const edges = await fetchAllInvoicesForAccount(acc);
-        const matched = [];
+        // 1. 先看看关键字里有没有能对上的客户名字。命中的话直接按 customerId 筛发票，范围通常小很多
+        const customers = await getCustomersForAccount(acc);
+        const matchingCustomerIds = customers
+            .filter(c => {
+                const nameLower = String(c.name || '').toLowerCase();
+                return keywords.some(kw => kw.length >= 2 && nameLower.includes(kw));
+            })
+            .map(c => c.id);
 
+        let edges;
+        if (matchingCustomerIds.length > 0 && matchingCustomerIds.length <= MAX_MATCHED_CUSTOMERS_FOR_FILTER) {
+            const perCustomerEdges = await Promise.all(
+                matchingCustomerIds.map(cid => fetchAllInvoicesForAccount(acc, { customerId: cid, ...(dateRange || {}) }))
+            );
+            edges = perCustomerEdges.flat();
+            console.log(`[Wave Debug] ${acc.name} 按客户名字匹配到 ${matchingCustomerIds.length} 个客户，共抓到 ${edges.length} 张发票`);
+        } else if (dateRange) {
+            edges = await fetchAllInvoicesForAccount(acc, dateRange);
+            console.log(`[Wave Debug] ${acc.name} 没匹配到客户名字，按日期范围 ${dateRange.invoiceDateStart} ~ ${dateRange.invoiceDateEnd} 筛，抓到 ${edges.length} 张发票`);
+        } else {
+            edges = await fetchAllInvoicesForAccount(acc);
+            console.log(`[Wave Debug] ${acc.name} 没有可下推的筛选条件，整表扫描，抓到 ${edges.length} 张发票`);
+        }
+
+        // 2. 不管上面怎么缩小范围，最后都用完整关键字逐个比对一遍，保证结果准确（筛选只是加速，不改变对不对）
+        const matched = [];
         for (let edge of edges) {
             const inv = edge.node;
             const invNum = String(inv.invoiceNumber || '').toLowerCase();
