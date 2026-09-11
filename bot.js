@@ -6,7 +6,7 @@ const http = require('http'); // 引入内置的 http 模块来满足 Render 端
 const TELEGRAM_BOT_TOKEN = "8957889878:AAGsOwGMnv8dNiSa22Bsl1VbYCAgdzohbNU"; 
 const WAVE_GRAPHQL_URL = "https://gql.waveapps.com/graphql/public";
 
-// 在这里配置你的多账号列表
+// 多账号列表
 const WAVE_ACCOUNTS = [
     {
         name: "Company A",
@@ -48,6 +48,9 @@ async function searchWaveInvoice(keywordInput) {
         `;
 
         try {
+            // 调试日志：打印当前请求的公司名称与 ID
+            console.log(`[Wave Debug] 正在请求公司: ${acc.name}, Business ID: ${acc.businessId}`);
+
             const response = await axios.post(WAVE_GRAPHQL_URL, {
                 query: query,
                 variables: { businessId: acc.businessId }
@@ -58,7 +61,11 @@ async function searchWaveInvoice(keywordInput) {
                 }
             });
 
+            // 调试日志：确认请求成功
+            console.log(`[Wave Debug] ${acc.name} 请求成功，状态码: ${response.status}`);
+
             if (!response.data || !response.data.data || !response.data.data.business) {
+                console.log(`[Wave Debug] ${acc.name} 返回数据中未找到 business，可能 ID 或 Token 不匹配。`);
                 return [];
             }
 
@@ -147,7 +154,7 @@ bot.on('text', async (ctx) => {
 bot.launch();
 console.log('✅ Telegram Bot successfully started and online!');
 
-// 启动一个微型 HTTP 服务器，专门用来通过 Render 的端口扫描，并响应 UptimeRobot 的 ping 唤醒
+// 启动微型 HTTP 服务器满足 Render 端口要求
 const PORT = process.env.PORT || 3000;
 http.createServer((req, res) => {
     res.writeHead(200, { 'Content-Type': 'text/plain' });
