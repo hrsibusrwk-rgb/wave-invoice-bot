@@ -215,9 +215,13 @@ async function getCustomersForAccount(acc) {
 
 // 把一些常见的口语化写法转成实际存在字段里的纯数字/文字，再去匹配
 function normalizeKeyword(kw) {
-    // "YE2026" -> "2026"：按年份匹配发票日期/付款日期
-    const yeMatch = kw.match(/^ye(\d{4})$/);
-    if (yeMatch) return yeMatch[1];
+    // "YE2026" -> "2026"，"YE26" -> "2026"：按年份匹配发票日期/付款日期
+    // 两位数年份一律当成 20XX（这是给 2000~2099 年用的，够用很久了）
+    const yeMatch = kw.match(/^ye(\d{2}|\d{4})$/);
+    if (yeMatch) {
+        const digits = yeMatch[1];
+        return digits.length === 2 ? `20${digits}` : digits;
+    }
 
     // "RM2720" / "RM2720.00" -> "2720" / "2720.00"：按金额匹配（金额字段本身不带 RM 字样）
     const rmMatch = kw.match(/^rm(\d+(\.\d+)?)$/);
@@ -334,6 +338,16 @@ async function searchWaveInvoice(keywordInput) {
     return allMatched;
 }
 
+// Telegram 的 Markdown（legacy）解析器很脆弱：发票号/客户名/链接这些"动态内容"里
+// 只要出现一个没配对的 _ 或 *（比如链接里常见的下划线），整条消息就会被 Telegram 拒收报 400。
+// 改用 HTML 格式，只需要转义 & < > 三个符号，比 Markdown 稳定很多。
+function escapeHtml(str) {
+    return String(str ?? '')
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;');
+}
+
 // Telegram 单条消息上限是 4096 字符，这里保守留一些余量，把结果切成多条消息发送
 const TELEGRAM_SAFE_LENGTH = 3500;
 // 匹配结果太多的时候（比如搜到某个客户名下几百张单），只展示前面这么多条，
@@ -345,18 +359,18 @@ async function replyWithResults(ctx, keyword, results) {
     const shown = results.slice(0, MAX_RESULTS_TO_SHOW);
 
     let chunks = [];
-    let current = `🎉 **Found ${totalCount} invoice(s) matching "${keyword}":**\n`;
+    let current = `🎉 <b>Found ${totalCount} invoice(s) matching "${escapeHtml(keyword)}":</b>\n`;
 
     for (const inv of shown) {
         const block = `\n-------------------\n` +
-                      `🏢 **Account:** ${inv.accountName}\n` +
-                      `📄 **Invoice No:** #${inv.invoiceNumber}\n` +
-                      `🏷️ **Status:** ${inv.status}\n` +
-                      `📅 **Invoice Date:** ${inv.invoiceDate}\n` +
-                      `👤 **Customer:** ${inv.customerName}\n` +
-                      `💰 **Amount Due:** RM${inv.amount}\n` +
-                      `💵 **Payment(s):** ${inv.paymentSummary}\n` +
-                      `🔗 **View Link:** ${inv.viewUrl}\n`;
+                      `🏢 <b>Account:</b> ${escapeHtml(inv.accountName)}\n` +
+                      `📄 <b>Invoice No:</b> #${escapeHtml(inv.invoiceNumber)}\n` +
+                      `🏷️ <b>Status:</b> ${escapeHtml(inv.status)}\n` +
+                      `📅 <b>Invoice Date:</b> ${escapeHtml(inv.invoiceDate)}\n` +
+                      `👤 <b>Customer:</b> ${escapeHtml(inv.customerName)}\n` +
+                      `💰 <b>Amount Due:</b> RM${escapeHtml(inv.amount)}\n` +
+                      `💵 <b>Payment(s):</b> ${escapeHtml(inv.paymentSummary)}\n` +
+                      `🔗 <b>View Link:</b> ${escapeHtml(inv.viewUrl)}\n`;
 
         if ((current + block).length > TELEGRAM_SAFE_LENGTH) {
             chunks.push(current);
@@ -377,7 +391,7 @@ async function replyWithResults(ctx, keyword, results) {
     }
 
     for (const chunk of chunks) {
-        await ctx.reply(chunk, { parse_mode: 'Markdown', disable_web_page_preview: true });
+        await ctx.reply(chunk, { parse_mode: 'HTML', disable_web_page_preview: true });
     }
 }
 
@@ -392,7 +406,7 @@ bot.on('text', async (ctx) => {
         const keyword = messageText.replace('#resend', '').replace('#find', '').trim();
 
         if (!keyword) {
-            await ctx.reply("⚠️ Please provide a keyword. Example: `#resend abc 2026-06`", { parse_mode: 'Markdown' });
+            await ctx.reply("⚠️ Please provide a keyword. Example: <code>#resend abc 2026-06</code>", { parse_mode: 'HTML' });
             return;
         }
 
