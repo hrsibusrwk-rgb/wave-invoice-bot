@@ -9,12 +9,12 @@ const WAVE_GRAPHQL_URL = "https://gql.waveapps.com/graphql/public";
 // 多账号列表
 const WAVE_ACCOUNTS = [
     {
-        name: "Solid Capital Consulting",
+        name: "Company A",
         businessId: "QnVzaW5lc3M6MmI5OGRiYjYtYWQ4My00OWM5LWIwZTEtYTUzNGJmYTk1MjBk",
         token: "sNkMtPQuJipbBEhkxtCBL2ydBAYF2l"
     },
     {
-        name: "Solid Capital Consulting Sdn. Bhd.",
+        name: "Company B",
         businessId: "QnVzaW5lc3M6NTY5NmNiMTYtZmE2Yi00NjEzLWFmNDMtYmZjMjNmNDA4NmY3",
         token: "CuF67Ugju7HR0w4UU9x41p9IeKpYdj"
     }
@@ -153,6 +153,52 @@ async function searchWaveInvoice(keywordInput) {
     return allMatched;
 }
 
+// Telegram 单条消息上限是 4096 字符，这里保守留一些余量，把结果切成多条消息发送
+const TELEGRAM_SAFE_LENGTH = 3500;
+// 匹配结果太多的时候（比如搜到某个客户名下几百张单），只展示前面这么多条，
+// 避免一次性刷几十条消息，并提示对方缩小搜索范围
+const MAX_RESULTS_TO_SHOW = 150;
+
+async function replyWithResults(ctx, keyword, results) {
+    const totalCount = results.length;
+    const shown = results.slice(0, MAX_RESULTS_TO_SHOW);
+
+    let chunks = [];
+    let current = `🎉 **Found ${totalCount} invoice(s) matching "${keyword}":**\n`;
+
+    for (const inv of shown) {
+        const block = `\n-------------------\n` +
+                      `🏢 **Account:** ${inv.accountName}\n` +
+                      `📄 **Invoice No:** #${inv.invoiceNumber}\n` +
+                      `🏷️ **Status:** ${inv.status}\n` +
+                      `📅 **Invoice Date:** ${inv.invoiceDate}\n` +
+                      `👤 **Customer:** ${inv.customerName}\n` +
+                      `💰 **Amount:** RM${inv.amount}\n` +
+                      `🔗 **View Link:** ${inv.viewUrl}\n`;
+
+        if ((current + block).length > TELEGRAM_SAFE_LENGTH) {
+            chunks.push(current);
+            current = block;
+        } else {
+            current += block;
+        }
+    }
+    if (current) chunks.push(current);
+
+    if (totalCount > MAX_RESULTS_TO_SHOW) {
+        const notice = `\n⚠️ Only showing the first ${MAX_RESULTS_TO_SHOW} of ${totalCount} matches. Please use a more specific keyword (e.g. add an invoice number or date) to narrow it down.`;
+        if ((chunks[chunks.length - 1].length + notice.length) <= TELEGRAM_SAFE_LENGTH) {
+            chunks[chunks.length - 1] += notice;
+        } else {
+            chunks.push(notice.trim());
+        }
+    }
+
+    for (const chunk of chunks) {
+        await ctx.reply(chunk, { parse_mode: 'Markdown', disable_web_page_preview: true });
+    }
+}
+
 bot.start((ctx) => {
     ctx.reply("👋 Hello! Multi-Account Wave Assistant is ready.");
 });
@@ -175,18 +221,7 @@ bot.on('text', async (ctx) => {
         if (results.length === 0) {
             await ctx.reply(`❌ No invoice records found matching all conditions for "${keyword}".`);
         } else {
-            let replyText = `🎉 **Found the following invoice(s):**\n`;
-            results.forEach((inv) => {
-                replyText += `\n-------------------\n` +
-                             `🏢 **Account:** ${inv.accountName}\n` +
-                             `📄 **Invoice No:** #${inv.invoiceNumber}\n` +
-                             `🏷️ **Status:** ${inv.status}\n` +
-                             `📅 **Invoice Date:** ${inv.invoiceDate}\n` +
-                             `👤 **Customer:** ${inv.customerName}\n` +
-                             `💰 **Amount:** RM${inv.amount}\n` +
-                             `🔗 **View Link:** ${inv.viewUrl}\n`;
-            });
-            await ctx.reply(replyText, { parse_mode: 'Markdown', disable_web_page_preview: true });
+            await replyWithResults(ctx, keyword, results);
         }
     }
 });
