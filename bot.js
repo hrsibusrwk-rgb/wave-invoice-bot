@@ -11,7 +11,7 @@ const WAVE_ACCOUNTS = [
     {
         name: "Company A",
         businessId: "2b98dbb6-ad83-49c9-b0e1-a534bfa9520d",
-        token: "O1bIO4eiS7otNo8JAUwOcCUfFv1wLv"
+        token: "sNkMtPQuJipbBEhkxtCBL2ydBAYF2l"
     },
     {
         name: "Company B",
