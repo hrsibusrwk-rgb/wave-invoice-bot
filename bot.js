@@ -421,12 +421,31 @@ function parseOneCellPerLinePaste(lines) {
 function parseCommandAndBody(fullText) {
     const lines = String(fullText || '').split(/\r?\n/);
     const firstLine = (lines[0] || '').trim();
+    const body = lines.slice(1).join('\n');
 
     let m = firstLine.match(/^#invoice\s+(\S+)\s*$/i);
-    if (m) return { action: 'invoice', accountCode: m[1], body: lines.slice(1).join('\n') };
+    if (m) return { action: 'invoice', accountCode: m[1], body };
 
-    m = firstLine.match(/^#edit\s+(\S+)\s+(\S+)\s*$/i);
-    if (m) return { action: 'edit', accountCode: m[1], invoiceNumber: m[2], body: lines.slice(1).join('\n') };
+    // Accept both "#edit SCC 4502" (code and number separated by a space)
+    // and "#edit SCC4502" / "#edit scc4502" (typed as one word, matching how Wave displays the invoice number)
+    m = firstLine.match(/^#edit\s+(.+)$/i);
+    if (m) {
+        const rest = m[1].trim();
+        const parts = rest.split(/\s+/);
+
+        if (parts.length >= 2) {
+            return { action: 'edit', accountCode: parts[0], invoiceNumber: parts.slice(1).join(' '), body };
+        }
+
+        const token = parts[0] || '';
+        const matchedAccount = wave.WAVE_ACCOUNTS.find(a => token.toLowerCase().startsWith(a.code.toLowerCase()));
+        if (matchedAccount) {
+            const invoiceNumber = token.slice(matchedAccount.code.length) || token;
+            return { action: 'edit', accountCode: matchedAccount.code, invoiceNumber, body };
+        }
+
+        return { action: 'usage_error' };
+    }
 
     if (/^#invoice\b/i.test(firstLine) || /^#edit\b/i.test(firstLine)) {
         return { action: 'usage_error' };
