@@ -1,12 +1,10 @@
 const { Telegraf } = require('telegraf');
-const axios = require('axios');
 const http = require('http'); // 引入内置的 http 模块来满足 Render 端口要求
 
 const wave = require('./wave');
-const { extractInvoiceFromImage } = require('./vision');
 
 // ==================== 配置区 ====================
-// ⚠️ 同样建议挪去 Render 的 Environment Variables，并在暴露过后重新生成一个新 token。
+// ⚠️ 建议挪去 Render 的 Environment Variables，并在暴露过后重新生成一个新 token。
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || "8957889878:AAGsOwGMnv8dNiSa22Bsl1VbYCAgdzohbNU";
 
 // 关键字匹配到的客户数超过这个数，就不逐个按客户筛了，直接整表/按日期扫
@@ -179,11 +177,21 @@ async function replyWithResults(ctx, keyword, results) {
 
 // ====================================================================
 // 第二部分：新功能 —— #invoice 开票 / #edit 改票
-// 用法：
-//   上传 Excel 截图，图片的"标题/caption"里写 "#invoice SCC" 或 "#invoice SB"  → 新建发票
-//   上传 Excel 截图，caption 写 "#edit SCC 4475"                              → 更新已存在发票的项目
-// 注意：caption 要跟图片一起发送（在 Telegram 里选好图片后，在下面的文字框里输入，再一起发出去），
-// 不是先发图片、再单独发一句文字。
+// 完全免费，不调用任何外部 AI/OCR 服务：直接从 Excel 复制表格粘贴成文字。
+//
+// 用法（在电脑上，从 Excel 选取要开票的范围，Ctrl+C 复制，到 Telegram 输入框 Ctrl+V 贴上，
+// 在最前面加一行指令，整段一起发送）：
+//
+//   #invoice SCC
+//   Company Name:	Duolus Techologies
+//   Item	Description	QTY	Price	Amount
+//   Payment on Behalf	EPF Aug26	1	1,236.00	1,236.00
+//   ...
+//
+//   #edit SCC 4475
+//   Company Name:	Duolus Techologies
+//   Item	Description	QTY	Price	Amount
+//   ...
 //
 // 出于安全考虑，这里完全没有实现任何"删除发票"的指令 —— 不管是 Telegram 指令还是内部函数，都没有。
 // ====================================================================
@@ -292,42 +300,80 @@ async function resolveProductIds(acc, items) {
     return resolved;
 }
 
-async function downloadTelegramPhoto(ctx) {
-    const photos = ctx.message.photo;
-    const best = photos[photos.length - 1]; // 最高分辨率
-    const fileLink = await ctx.telegram.getFileLink(best.file_id);
-    const response = await axios.get(fileLink.href, { responseType: 'arraybuffer' });
-    return Buffer.from(response.data);
+// 解析从 Excel 粘贴过来的文字（Tab 分隔）
+function parseInvoicePaste(bodyText) {
+    const lines = String(bodyText || '').split(/\r?\n/);
+    let companyName = null;
+    const items = [];
+
+    for (const rawLine of lines) {
+        if (!rawLine.trim()) continue;
+
+        const cells = rawLine.split('\t').map(c => c.trim());
+        const firstCellLower = (cells[0] || '').toLowerCase();
+
+        if (firstCellLower.startsWith('company name')) {
+            let name = cells[1] || '';
+            if (!name) {
+                const afterColon = rawLine.split(':').slice(1).join(':').trim();
+                name = afterColon.split('\t')[0].trim();
+            }
+            companyName = name;
+            continue;
+        }
+
+        if (firstCellLower === 'item') {
+            continue; // 表头行，跳过
+        }
+
+        if (cells.length < 4) continue; // 数据不完整（比如空行、合计行只有一两格），跳过
+
+        const item = cells[0];
+        const description = cells[1];
+        const qtyRaw = cells[2];
+        const priceRaw = cells[3];
+
+        if (!item || !qtyRaw || !priceRaw) continue;
+
+        const qty = parseFloat(qtyRaw.replace(/,/g, ''));
+        const price = parseFloat(String(priceRaw).replace(/[^0-9.\-]/g, ''));
+
+        if (!Number.isFinite(qty) || !Number.isFinite(price)) continue;
+
+        items.push({ item, description, qty, price });
+    }
+
+    return { companyName, items };
 }
 
-function parseCaption(caption) {
-    if (!caption) return null;
-    const text = caption.trim();
+// 解析消息第一行的指令（#invoice SCC / #edit SCC 4475），剩下的行当作贴过来的表格内容
+function parseCommandAndBody(fullText) {
+    const lines = String(fullText || '').split(/\r?\n/);
+    const firstLine = (lines[0] || '').trim();
 
-    let m = text.match(/^#invoice\s+(\S+)\s*$/i);
-    if (m) return { action: 'invoice', accountCode: m[1] };
+    let m = firstLine.match(/^#invoice\s+(\S+)\s*$/i);
+    if (m) return { action: 'invoice', accountCode: m[1], body: lines.slice(1).join('\n') };
 
-    m = text.match(/^#edit\s+(\S+)\s+(\S+)\s*$/i);
-    if (m) return { action: 'edit', accountCode: m[1], invoiceNumber: m[2] };
+    m = firstLine.match(/^#edit\s+(\S+)\s+(\S+)\s*$/i);
+    if (m) return { action: 'edit', accountCode: m[1], invoiceNumber: m[2], body: lines.slice(1).join('\n') };
 
-    if (/^#invoice\b/i.test(text) || /^#edit\b/i.test(text)) {
+    if (/^#invoice\b/i.test(firstLine) || /^#edit\b/i.test(firstLine)) {
         return { action: 'usage_error' };
     }
     return null;
 }
 
-bot.on('photo', async (ctx) => {
-    const parsed = parseCaption(ctx.message.caption);
-    if (!parsed) return; // 没有 #invoice / #edit 的图片，不处理（也不影响其他功能）
+const USAGE_TEXT =
+    "⚠️ 格式不对。正确用法是（在电脑上从 Excel 复制要开票的范围，粘贴在指令下面，整段一起发送）：\n\n" +
+    "<code>#invoice SCC\n" +
+    "Company Name:\tXXX\n" +
+    "Item\tDescription\tQTY\tPrice\tAmount\n" +
+    "服务项目\t说明\t1\t100.00\t100.00</code>\n\n" +
+    "改发票用 <code>#edit SCC 4475</code>（账号代号 + 发票号码），下面同样贴表格内容。";
 
+async function handleInvoiceOrEditCommand(ctx, parsed) {
     if (parsed.action === 'usage_error') {
-        await ctx.reply(
-            "⚠️ 格式不对。\n" +
-            "新建发票：图片标题写 <code>#invoice SCC</code> 或 <code>#invoice SB</code>\n" +
-            "修改发票：图片标题写 <code>#edit SCC 4475</code>（账号代号 + 发票号码）\n" +
-            "记得标题要跟图片一起发出去，不要分开发。",
-            { parse_mode: 'HTML' }
-        );
+        await ctx.reply(USAGE_TEXT, { parse_mode: 'HTML' });
         return;
     }
 
@@ -338,25 +384,19 @@ bot.on('photo', async (ctx) => {
     }
 
     const chatId = ctx.chat.id;
-
-    await ctx.reply('🔍 收到截图，正在识别内容...');
-
-    let extracted;
-    try {
-        const imageBuffer = await downloadTelegramPhoto(ctx);
-        extracted = await extractInvoiceFromImage(imageBuffer);
-    } catch (err) {
-        console.error('[Invoice] 图片识别失败:', err.response?.data || err.message);
-        await ctx.reply('❌ 图片识别失败：' + (err.message || '未知错误') + '\n换一张更清晰的截图再试一次。');
-        return;
-    }
+    const extracted = parseInvoicePaste(parsed.body);
 
     if (!extracted.items || extracted.items.length === 0) {
-        await ctx.reply('❌ 没能从截图里认出任何一行数据，换一张更清晰的截图再试一次。');
+        await ctx.reply('❌ 没有解析到任何一行有效数据，检查一下是不是完整从 Excel 复制粘贴过来的（要包含 Tab 分隔，不要手动加空格）。\n\n' + USAGE_TEXT, { parse_mode: 'HTML' });
         return;
     }
 
     if (parsed.action === 'invoice') {
+        if (!extracted.companyName) {
+            await ctx.reply('❌ 没有找到 "Company Name" 那一行，请确认粘贴的内容里有这一行。');
+            return;
+        }
+
         let customers;
         try {
             customers = await wave.getCustomersForAccount(acc);
@@ -374,7 +414,7 @@ bot.on('photo', async (ctx) => {
             createdAt: Date.now()
         });
 
-        let msg = `📋 从截图里读到的资料：\n公司名：<b>${escapeHtml(extracted.companyName)}</b>\n账号：${escapeHtml(acc.name)}\n\n`;
+        let msg = `📋 读到的资料：\n公司名：<b>${escapeHtml(extracted.companyName)}</b>\n账号：${escapeHtml(acc.name)}\n项目行数：${extracted.items.length}\n\n`;
         msg += '请选择这张发票要 Bill To 哪个 Wave 客户（回复数字）：\n';
         candidates.forEach((c, idx) => {
             msg += `${idx + 1}. ${escapeHtml(c.customer.name)}（相似度 ${(c.score * 100).toFixed(0)}%）\n`;
@@ -423,7 +463,7 @@ bot.on('photo', async (ctx) => {
         await ctx.reply(msg, { parse_mode: 'HTML' });
         return;
     }
-});
+}
 
 async function handleCustomerChoice(ctx, pending, choiceText) {
     const chatId = ctx.chat.id;
@@ -546,41 +586,57 @@ async function handleConfirm(ctx, pending) {
 bot.start((ctx) => {
     ctx.reply("👋 Hello! Multi-Account Wave Assistant is ready.\n\n" +
         "查发票：#find <关键字>\n" +
-        "开发票：上传 Excel 截图，标题写 #invoice SCC（或 SB）\n" +
-        "改发票：上传 Excel 截图，标题写 #edit SCC <发票号码>");
+        "开发票：#invoice SCC（或 SB），下面贴 Excel 表格内容\n" +
+        "改发票：#edit SCC <发票号码>，下面贴 Excel 表格内容");
+});
+
+// 有人图省事直接传图片，提醒改成复制粘贴文字（不处理图片，完全免费方案不用图片）
+bot.on('photo', async (ctx) => {
+    const caption = (ctx.message.caption || '').trim();
+    if (/^#invoice\b/i.test(caption) || /^#edit\b/i.test(caption)) {
+        await ctx.reply('这个功能改成不用截图了：请在电脑上从 Excel 复制要开票的范围，直接贴成文字发过来（不是发图片）。' + '\n\n' + USAGE_TEXT, { parse_mode: 'HTML' });
+    }
 });
 
 bot.on('text', async (ctx) => {
-    const messageText = ctx.message.text.trim();
+    const messageText = ctx.message.text;
     const chatId = ctx.chat.id;
+    const trimmed = messageText.trim();
 
     // ---- 先看看这个聊天窗口是不是有正在等确认的开票/改票操作 ----
     const pending = clearStalePending(chatId);
     if (pending) {
-        if (/^#cancel$/i.test(messageText)) {
+        if (/^#cancel$/i.test(trimmed)) {
             pendingActions.delete(chatId);
             await ctx.reply('已取消。');
             return;
         }
         if (pending.mode === 'create' && !pending.step) {
             // 还在等客户选择
-            await handleCustomerChoice(ctx, pending, messageText);
+            await handleCustomerChoice(ctx, pending, trimmed);
             return;
         }
-        if (/^#confirm$/i.test(messageText)) {
+        if (/^#confirm$/i.test(trimmed)) {
             await handleConfirm(ctx, pending);
             return;
         }
         // 有 pending 但发来的既不是数字选择也不是 #confirm/#cancel，且不是别的指令，提示一下
-        if (!/^#(find|resend|schema)\b/i.test(messageText)) {
-            await ctx.reply('目前有一个操作在等你确认，回复 #confirm 确认、#cancel 取消，或者重新发一次截图。');
+        if (!/^#(find|resend|schema|invoice|edit)\b/i.test(trimmed)) {
+            await ctx.reply('目前有一个操作在等你确认，回复 #confirm 确认、#cancel 取消，或者重新贴一次表格内容。');
             return;
         }
     }
 
+    // ---- 新功能：#invoice / #edit（贴 Excel 表格内容） ----
+    const parsedCommand = parseCommandAndBody(messageText);
+    if (parsedCommand) {
+        await handleInvoiceOrEditCommand(ctx, parsedCommand);
+        return;
+    }
+
     // ---- 临时调试指令：查 Wave 某个类型的字段（正式核对完 schema 后可以删掉这段） ----
-    if (messageText.startsWith('#schema')) {
-        const parts = messageText.split(/\s+/);
+    if (trimmed.startsWith('#schema')) {
+        const parts = trimmed.split(/\s+/);
         const typeName = parts[parts.length - 1];
         const acc = wave.WAVE_ACCOUNTS[0];
         try {
@@ -593,8 +649,8 @@ bot.on('text', async (ctx) => {
     }
 
     // ---- 原本的查发票功能 ----
-    if (messageText.startsWith('#resend') || messageText.startsWith('#find')) {
-        const keyword = messageText.replace('#resend', '').replace('#find', '').trim();
+    if (trimmed.startsWith('#resend') || trimmed.startsWith('#find')) {
+        const keyword = trimmed.replace('#resend', '').replace('#find', '').trim();
 
         if (!keyword) {
             await ctx.reply("⚠️ Please provide a keyword. Example: <code>#resend abc 2026-06</code>", { parse_mode: 'HTML' });
