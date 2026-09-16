@@ -315,14 +315,23 @@ async function resolveProductIds(acc, items) {
     return resolved;
 }
 
-// Parse the pasted Excel content.
-// Pasting from a computer is usually "one line, 5 tab-separated cells". On mobile, the
-// keyboard/clipboard often turns tabs into line breaks, giving "one cell per line" instead.
-// Both formats are auto-detected here so the user doesn't need to know which one they have.
-function parseInvoicePaste(bodyText) {
+// Parse the pasted Excel content. Three formats are auto-detected so the user doesn't need to
+// know which one they have:
+//   1. Desktop paste: one line per row, cells separated by real tab characters.
+//   2. Mobile paste: the keyboard/clipboard turns tabs into line breaks, so each cell is on its own line.
+//   3. Browser paste (e.g. Telegram Web): tabs get collapsed into plain spaces, so a whole row ends up
+//      as one space-separated line with no reliable delimiter between the Item and Description cells.
+//      For that case, known product/service names already in Wave are used to figure out where the
+//      Item name ends and the Description begins.
+function parseInvoicePaste(bodyText, knownItemNames = []) {
     const rawLines = String(bodyText || '').split(/\r?\n/);
     const hasTabs = rawLines.some(l => l.includes('\t'));
-    return hasTabs ? parseTabSeparatedPaste(rawLines) : parseOneCellPerLinePaste(rawLines);
+    if (hasTabs) return parseTabSeparatedPaste(rawLines);
+
+    const looksLikeSpaceColumns = rawLines.some(l => /^item\s+description\s+qty\b/i.test(l.trim()));
+    if (looksLikeSpaceColumns) return parseSpaceColumnPaste(rawLines, knownItemNames);
+
+    return parseOneCellPerLinePaste(rawLines);
 }
 
 // Format 1: desktop paste, one line with several tab-separated cells
@@ -431,6 +440,59 @@ function parseOneCellPerLinePaste(lines) {
     return { companyName, items };
 }
 
+// Format 3: browser paste (e.g. Telegram Web) where tabs got collapsed into spaces, so each row is
+// "Item Description QTY Price Amount" all on one line with no reliable delimiter between Item and
+// Description. We pull the trailing QTY/Price/Amount numbers off the end of the line (those are always
+// there), then match the start of what's left against known existing Wave product/service names to
+// split Item from Description. If nothing matches (e.g. a brand-new item never invoiced before), the
+// whole remaining text is used as the Item name — still works, just doesn't split out a Description
+// (and will match cleanly next time, once that item name exists in Wave).
+function parseSpaceColumnPaste(lines, knownItemNames) {
+    let companyName = null;
+    const items = [];
+    const sortedNames = [...new Set((knownItemNames || []).filter(Boolean))].sort((a, b) => b.length - a.length);
+
+    // Greedy (.+) naturally backtracks to the rightmost point where the rest of the line is exactly
+    // "QTY PRICE AMOUNT", which is what isolates the trailing numeric columns from the item/description text.
+    const rowPattern = /^(.+)\s+(\d+(?:\.\d+)?)\s+([\d,]+(?:\.\d+)?)\s+([\d,]+(?:\.\d+)?)\s*$/;
+
+    for (const rawLine of lines) {
+        const line = rawLine.trim();
+        if (!line) continue;
+
+        const cnMatch = line.match(/^company name\s*:?\s*(.*)$/i);
+        if (cnMatch) {
+            companyName = cnMatch[1].trim();
+            continue;
+        }
+
+        if (/^item\s+description\s+qty\b/i.test(line)) continue; // header row, skip
+
+        const m = line.match(rowPattern);
+        if (!m) continue;
+
+        const rest = m[1].trim();
+        const qty = parseFloat(m[2].replace(/,/g, ''));
+        const price = parseFloat(m[3].replace(/,/g, ''));
+
+        if (!rest || !Number.isFinite(qty) || !Number.isFinite(price)) continue;
+
+        let item = rest;
+        let description = '';
+        const foundName = sortedNames.find(n =>
+            rest.toLowerCase() === n.toLowerCase() || rest.toLowerCase().startsWith(n.toLowerCase() + ' ')
+        );
+        if (foundName) {
+            item = foundName;
+            description = rest.slice(foundName.length).trim();
+        }
+
+        items.push({ item, description, qty, price });
+    }
+
+    return { companyName, items };
+}
+
 // Parse the command on the first line (#invoice SCC / #edit SCC 4475); the rest is the pasted table
 function parseCommandAndBody(fullText) {
     const lines = String(fullText || '').split(/\r?\n/);
@@ -479,17 +541,28 @@ async function handleInvoiceOrEditCommand(ctx, parsed) {
     }
 
     const chatId = ctx.chat.id;
-    const extracted = parseInvoicePaste(parsed.body);
-
-    if (!extracted.items || extracted.items.length === 0) {
-        await ctx.reply('❌ Could not parse any valid rows. Make sure you copied and pasted the full table from Excel (it needs to be tab-separated, not manually typed with spaces).\n\n' + USAGE_TEXT, { parse_mode: 'HTML' });
-        return;
-    }
 
     if (parsed.action === 'invoice') {
         const acc = wave.findAccountByCode(parsed.accountCode);
         if (!acc) {
             await ctx.reply(`⚠️ Unknown account code "${escapeHtml(parsed.accountCode)}". Available codes: ` + wave.WAVE_ACCOUNTS.map(a => `${a.code} (${a.name})`).join(', '));
+            return;
+        }
+
+        // Products are fetched before parsing (not just for later product-matching) because the
+        // browser-paste format (Format 3) needs known item names to split Item from Description.
+        let products;
+        try {
+            products = await wave.getProductsForAccount(acc);
+        } catch (err) {
+            await ctx.reply('❌ Failed to load the Wave product/service list: ' + describeAxiosError(err));
+            return;
+        }
+
+        const extracted = parseInvoicePaste(parsed.body, products.map(p => p.name));
+
+        if (!extracted.items || extracted.items.length === 0) {
+            await ctx.reply('❌ Could not parse any valid rows. Make sure you copied and pasted the full table from Excel, including the header row.\n\n' + USAGE_TEXT, { parse_mode: 'HTML' });
             return;
         }
 
@@ -581,6 +654,14 @@ async function handleInvoiceOrEditCommand(ctx, parsed) {
             await ctx.reply('❌ Failed to load the Wave product/service list: ' + describeAxiosError(err));
             return;
         }
+
+        const extracted = parseInvoicePaste(parsed.body, products.map(p => p.name));
+
+        if (!extracted.items || extracted.items.length === 0) {
+            await ctx.reply('❌ Could not parse any valid rows. Make sure you copied and pasted the full table from Excel, including the header row.\n\n' + USAGE_TEXT, { parse_mode: 'HTML' });
+            return;
+        }
+
         const plannedItems = planProductMatches(extracted.items, products);
 
         pendingActions.set(chatId, {
