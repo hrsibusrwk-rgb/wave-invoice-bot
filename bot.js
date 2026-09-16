@@ -131,6 +131,20 @@ function escapeHtml(str) {
         .replace(/>/g, '&gt;');
 }
 
+// When a Wave API call fails outright (e.g. HTTP 400), axios only gives a generic
+// "Request failed with status code 400" in err.message — the actually useful detail
+// is in err.response.data. This pulls that out so replies show the real reason.
+function describeAxiosError(err) {
+    if (err && err.response && err.response.data !== undefined) {
+        try {
+            return JSON.stringify(err.response.data, null, 2).slice(0, 3000);
+        } catch (e) {
+            // fall through
+        }
+    }
+    return err && err.message ? err.message : String(err);
+}
+
 const TELEGRAM_SAFE_LENGTH = 3500;
 const MAX_RESULTS_TO_SHOW = 150;
 
@@ -289,7 +303,7 @@ async function resolveProductIds(acc, items) {
             resolved.push({ ...it, productId: created.get(norm) });
             continue;
         }
-        const result = await wave.createProduct(acc, it.item);
+        const result = await wave.createProduct(acc, it.item, it.price);
         const payload = result?.data?.productCreate;
         if (!payload?.didSucceed || !payload?.product?.id) {
             throw new Error(`Failed to create service item "${it.item}": ` + JSON.stringify(payload?.inputErrors || result.errors || result));
@@ -426,8 +440,12 @@ function parseCommandAndBody(fullText) {
     let m = firstLine.match(/^#invoice\s+(\S+)\s*$/i);
     if (m) return { action: 'invoice', accountCode: m[1], body };
 
-    // Accept both "#edit SCC 4502" (code and number separated by a space)
-    // and "#edit SCC4502" / "#edit scc4502" (typed as one word, matching how Wave displays the invoice number)
+    // Accept "#edit SCC 4502" (code and number separated by a space).
+    // Accept "#edit SCC-02127" / "#edit 4502" (a single token) WITHOUT guessing the account from it —
+    // Wave's own invoice-number prefix does not necessarily match our SCC/SB account codes (an invoice
+    // under the "SB" account can still be numbered "SCC-...", since that prefix is Wave's own setting,
+    // not ours). When only one token is given, accountCode is left null and the caller searches every
+    // account for that invoice number instead of assuming which one it belongs to.
     m = firstLine.match(/^#edit\s+(.+)$/i);
     if (m) {
         const rest = m[1].trim();
@@ -437,14 +455,7 @@ function parseCommandAndBody(fullText) {
             return { action: 'edit', accountCode: parts[0], invoiceNumber: parts.slice(1).join(' '), body };
         }
 
-        const token = parts[0] || '';
-        const matchedAccount = wave.WAVE_ACCOUNTS.find(a => token.toLowerCase().startsWith(a.code.toLowerCase()));
-        if (matchedAccount) {
-            const invoiceNumber = token.slice(matchedAccount.code.length) || token;
-            return { action: 'edit', accountCode: matchedAccount.code, invoiceNumber, body };
-        }
-
-        return { action: 'usage_error' };
+        return { action: 'edit', accountCode: null, invoiceNumber: parts[0] || '', body };
     }
 
     if (/^#invoice\b/i.test(firstLine) || /^#edit\b/i.test(firstLine)) {
@@ -467,12 +478,6 @@ async function handleInvoiceOrEditCommand(ctx, parsed) {
         return;
     }
 
-    const acc = wave.findAccountByCode(parsed.accountCode);
-    if (!acc) {
-        await ctx.reply(`⚠️ Unknown account code "${escapeHtml(parsed.accountCode)}". Available codes: ` + wave.WAVE_ACCOUNTS.map(a => `${a.code} (${a.name})`).join(', '));
-        return;
-    }
-
     const chatId = ctx.chat.id;
     const extracted = parseInvoicePaste(parsed.body);
 
@@ -482,6 +487,12 @@ async function handleInvoiceOrEditCommand(ctx, parsed) {
     }
 
     if (parsed.action === 'invoice') {
+        const acc = wave.findAccountByCode(parsed.accountCode);
+        if (!acc) {
+            await ctx.reply(`⚠️ Unknown account code "${escapeHtml(parsed.accountCode)}". Available codes: ` + wave.WAVE_ACCOUNTS.map(a => `${a.code} (${a.name})`).join(', '));
+            return;
+        }
+
         if (!extracted.companyName) {
             await ctx.reply('❌ Could not find a "Company Name" line. Please make sure the pasted content includes it.');
             return;
@@ -491,7 +502,7 @@ async function handleInvoiceOrEditCommand(ctx, parsed) {
         try {
             customers = await wave.getCustomersForAccount(acc);
         } catch (err) {
-            await ctx.reply('❌ Failed to load the Wave customer list: ' + err.message);
+            await ctx.reply('❌ Failed to load the Wave customer list: ' + describeAxiosError(err));
             return;
         }
         const candidates = findCustomerCandidates(customers, extracted.companyName);
@@ -516,15 +527,50 @@ async function handleInvoiceOrEditCommand(ctx, parsed) {
     }
 
     if (parsed.action === 'edit') {
-        let existingInvoice;
-        try {
-            existingInvoice = await wave.findInvoiceByNumber(acc, parsed.invoiceNumber);
-        } catch (err) {
-            await ctx.reply('❌ Failed to look up the invoice: ' + err.message);
-            return;
+        let acc = null;
+        let existingInvoice = null;
+
+        if (parsed.accountCode) {
+            // Account explicitly given (e.g. "#edit SB 4502") — look up only in that one.
+            acc = wave.findAccountByCode(parsed.accountCode);
+            if (!acc) {
+                await ctx.reply(`⚠️ Unknown account code "${escapeHtml(parsed.accountCode)}". Available codes: ` + wave.WAVE_ACCOUNTS.map(a => `${a.code} (${a.name})`).join(', '));
+                return;
+            }
+            try {
+                existingInvoice = await wave.findInvoiceByNumber(acc, parsed.invoiceNumber);
+            } catch (err) {
+                await ctx.reply('❌ Failed to look up the invoice: ' + describeAxiosError(err));
+                return;
+            }
+        } else {
+            // No account given (e.g. "#edit SCC-02127") — an invoice's number prefix doesn't reliably
+            // tell us which of our accounts it's in, so check every account instead of guessing.
+            const matches = [];
+            for (const a of wave.WAVE_ACCOUNTS) {
+                try {
+                    const inv = await wave.findInvoiceByNumber(a, parsed.invoiceNumber);
+                    if (inv) matches.push({ account: a, invoice: inv });
+                } catch (err) {
+                    await ctx.reply(`❌ Failed to look up the invoice in ${a.name}: ` + describeAxiosError(err));
+                    return;
+                }
+            }
+            if (matches.length > 1) {
+                await ctx.reply('⚠️ Found an invoice with that number in more than one account. Please specify which one:\n' +
+                    matches.map(m => `<code>#edit ${escapeHtml(m.account.code)} ${escapeHtml(parsed.invoiceNumber)}</code> (${escapeHtml(m.account.name)})`).join('\n'),
+                    { parse_mode: 'HTML' });
+                return;
+            }
+            if (matches.length === 1) {
+                acc = matches[0].account;
+                existingInvoice = matches[0].invoice;
+            }
         }
+
         if (!existingInvoice) {
-            await ctx.reply(`❌ Couldn't find an invoice in ${acc.name} with a number containing "${escapeHtml(parsed.invoiceNumber)}". Double-check the number.`);
+            const where = parsed.accountCode ? `in ${acc.name}` : 'in any account';
+            await ctx.reply(`❌ Couldn't find an invoice with a number containing "${escapeHtml(parsed.invoiceNumber)}" ${where}. Double-check the number, or specify the account explicitly, e.g. <code>#edit SB ${escapeHtml(parsed.invoiceNumber)}</code>.`, { parse_mode: 'HTML' });
             return;
         }
 
@@ -532,7 +578,7 @@ async function handleInvoiceOrEditCommand(ctx, parsed) {
         try {
             products = await wave.getProductsForAccount(acc);
         } catch (err) {
-            await ctx.reply('❌ Failed to load the Wave product/service list: ' + err.message);
+            await ctx.reply('❌ Failed to load the Wave product/service list: ' + describeAxiosError(err));
             return;
         }
         const plannedItems = planProductMatches(extracted.items, products);
@@ -577,7 +623,7 @@ async function handleCustomerChoice(ctx, pending, choiceText) {
             chosenCustomerName = payload.customer.name;
             wave.invalidateCustomerCache(pending.acc);
         } catch (err) {
-            await ctx.reply('❌ Failed to create the customer: ' + err.message);
+            await ctx.reply('❌ Failed to create the customer: ' + describeAxiosError(err));
             return;
         }
     } else {
@@ -589,7 +635,7 @@ async function handleCustomerChoice(ctx, pending, choiceText) {
     try {
         products = await wave.getProductsForAccount(pending.acc);
     } catch (err) {
-        await ctx.reply('❌ Failed to load the Wave product/service list: ' + err.message);
+        await ctx.reply('❌ Failed to load the Wave product/service list: ' + describeAxiosError(err));
         return;
     }
     const plannedItems = planProductMatches(pending.extracted.items, products);
@@ -637,7 +683,7 @@ async function handleConfirm(ctx, pending) {
             );
         } catch (err) {
             console.error('[Invoice] create failed:', err.response?.data || err.message);
-            await ctx.reply('❌ Failed to create the invoice: ' + err.message);
+            await ctx.reply('❌ Failed to create the invoice: ' + describeAxiosError(err));
         } finally {
             pendingActions.delete(chatId);
         }
@@ -661,7 +707,7 @@ async function handleConfirm(ctx, pending) {
             );
         } catch (err) {
             console.error('[Invoice] update failed:', err.response?.data || err.message);
-            await ctx.reply('❌ Failed to update the invoice: ' + err.message);
+            await ctx.reply('❌ Failed to update the invoice: ' + describeAxiosError(err));
         } finally {
             pendingActions.delete(chatId);
         }
