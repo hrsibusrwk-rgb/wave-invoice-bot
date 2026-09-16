@@ -2,247 +2,42 @@ const { Telegraf } = require('telegraf');
 const axios = require('axios');
 const http = require('http'); // 引入内置的 http 模块来满足 Render 端口要求
 
+const wave = require('./wave');
+const { extractInvoiceFromImage } = require('./vision');
+
 // ==================== 配置区 ====================
-const TELEGRAM_BOT_TOKEN = "8957889878:AAGsOwGMnv8dNiSa22Bsl1VbYCAgdzohbNU";
-const WAVE_GRAPHQL_URL = "https://gql.waveapps.com/graphql/public";
+// ⚠️ 同样建议挪去 Render 的 Environment Variables，并在暴露过后重新生成一个新 token。
+const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || "8957889878:AAGsOwGMnv8dNiSa22Bsl1VbYCAgdzohbNU";
 
-// 多账号列表
-const WAVE_ACCOUNTS = [
-    {
-        name: "Solid Capital Consulting",
-        businessId: "QnVzaW5lc3M6MmI5OGRiYjYtYWQ4My00OWM5LWIwZTEtYTUzNGJmYTk1MjBk",
-        token: "sNkMtPQuJipbBEhkxtCBL2ydBAYF2l"
-    },
-    {
-        name: "Solid Capital Consulting Sdn. Bhd.",
-        businessId: "QnVzaW5lc3M6NTY5NmNiMTYtZmE2Yi00NjEzLWFmNDMtYmZjMjNmNDA4NmY3",
-        token: "CuF67Ugju7HR0w4UU9x41p9IeKpYdj"
-    }
-];
-
-// 每页拉多少条记录
-const PAGE_SIZE = 50;
-// 单次翻页最多翻多少页，防止数据超多时无限翻页
-// 1000 页 * 50 张/页 = 最多抓 50000 条
-const MAX_PAGES_PER_ACCOUNT = 1000;
-// 拿到第 1 页、确认总页数之后，剩下的页数几个一批并发抓取，加快速度
-// Wave API 有限速，并发太高会被 429/RATE_LIMITED 拒绝，2 是比较稳的数字
-const FETCH_CONCURRENCY = 2;
-// 单页被限速时最多重试几次，超过就放弃这一页
-const MAX_RETRIES_PER_PAGE = 5;
-// 关键字匹配到的客户数超过这个数，就不逐个按客户筛了（大概率不是在搜具体某个客户），直接整表/按日期扫
+// 关键字匹配到的客户数超过这个数，就不逐个按客户筛了，直接整表/按日期扫
 const MAX_MATCHED_CUSTOMERS_FOR_FILTER = 20;
-// 客户列表缓存多久（客户变动不频繁，不用每次搜索都重新拉一次）
-const CUSTOMER_CACHE_TTL_MS = 10 * 60 * 1000; // 10 分钟
-
-function sleep(ms) {
-    return new Promise(resolve => setTimeout(resolve, ms));
-}
 
 const bot = new Telegraf(TELEGRAM_BOT_TOKEN);
 
-// invoices 支持 customerId / invoiceDateStart / invoiceDateEnd 等参数做服务器端筛选，
-// 不传（undefined -> null）就等于不筛，跟以前整表扫的行为一样
-const INVOICES_QUERY = `
-query($businessId: ID!, $page: Int!, $pageSize: Int!, $customerId: ID, $invoiceDateStart: Date, $invoiceDateEnd: Date) {
-    business(id: $businessId) {
-        invoices(page: $page, pageSize: $pageSize, customerId: $customerId, invoiceDateStart: $invoiceDateStart, invoiceDateEnd: $invoiceDateEnd) {
-            pageInfo {
-                currentPage
-                totalPages
-            }
-            edges {
-                node {
-                    invoiceNumber
-                    invoiceDate
-                    amountDue {
-                        value
-                    }
-                    status
-                    viewUrl
-                    customer {
-                        name
-                    }
-                    payments {
-                        paymentDate
-                        amount
-                        paymentMethod
-                    }
-                }
-            }
-        }
-    }
-}
-`;
+// ====================================================================
+// 第一部分：原本就有的 #find / #resend 查发票功能（逻辑不变，只是改成调用 wave.js）
+// ====================================================================
 
-const CUSTOMERS_QUERY = `
-query($businessId: ID!, $page: Int!, $pageSize: Int!) {
-    business(id: $businessId) {
-        customers(page: $page, pageSize: $pageSize) {
-            pageInfo {
-                currentPage
-                totalPages
-            }
-            edges {
-                node {
-                    id
-                    name
-                }
-            }
-        }
-    }
-}
-`;
-
-// 请求某一页数据（发票或客户，由传进来的 query/variables 决定）；遇到 Wave 的限速会自动等待后重试
-async function graphqlRequestWithRetry(acc, label, queryString, variables, page, attempt = 1) {
-    console.log(`[Wave Debug] 正在请求公司: ${acc.name} (${label}), 第 ${page} 页${attempt > 1 ? ` (第 ${attempt} 次尝试)` : ''}`);
-
-    const response = await axios.post(WAVE_GRAPHQL_URL, {
-        query: queryString,
-        variables: variables
-    }, {
-        headers: {
-            "Authorization": `Bearer ${acc.token}`,
-            "Content-Type": "application/json"
-        }
-    });
-
-    console.log(`[Wave Debug] ${acc.name} (${label}) 第 ${page} 页请求成功，状态码: ${response.status}`);
-
-    const rateLimitError = response.data.errors?.find(e => e.extensions?.code === 'RATE_LIMITED');
-
-    if (rateLimitError) {
-        if (attempt >= MAX_RETRIES_PER_PAGE) {
-            console.log(`[Wave Debug] ${acc.name} (${label}) 第 ${page} 页被限速 ${attempt} 次后放弃`);
-            return { business: null, gaveUp: true };
-        }
-
-        const resetAtMs = rateLimitError.extensions?.resetAt ? new Date(rateLimitError.extensions.resetAt).getTime() : NaN;
-        const waitMs = Number.isFinite(resetAtMs)
-            ? Math.max(resetAtMs - Date.now(), 300) + 300 // 多留 300ms 缓冲
-            : 1000 * attempt; // 拿不到 resetAt 就用简单的递增等待兜底
-
-        console.log(`[Wave Debug] ${acc.name} (${label}) 第 ${page} 页被限速，等待 ${waitMs}ms 后重试`);
-        await sleep(waitMs);
-        return graphqlRequestWithRetry(acc, label, queryString, variables, page, attempt + 1);
-    }
-
-    if (response.data.errors) {
-        console.log(`[Wave Debug] ${acc.name} (${label}) 第 ${page} 页 GraphQL 报错:`, JSON.stringify(response.data.errors));
-    }
-
-    return { business: response.data?.data?.business, gaveUp: false };
-}
-
-// 通用翻页抓取：自动翻到最后一页，第 2 页起分批并发抓取
-async function fetchAllPages(acc, label, queryString, extraVars, getConnection) {
-    let allEdges = [];
-
-    let firstResult;
-    try {
-        firstResult = await graphqlRequestWithRetry(acc, label, queryString, { businessId: acc.businessId, page: 1, pageSize: PAGE_SIZE, ...extraVars }, 1);
-    } catch (error) {
-        console.error(`Wave Search Error for ${acc.name} (${label}, page 1):`, error.response?.data || error.message);
-        return allEdges;
-    }
-
-    const firstBusiness = firstResult.business;
-    if (!firstBusiness) {
-        if (firstResult.gaveUp) {
-            console.log(`[Wave Debug] ${acc.name} (${label}) 第 1 页一直被限速，这次先放弃，等一下再搜应该就好了`);
-        } else {
-            console.log(`[Wave Debug] ${acc.name} (${label}) 返回数据中未找到 business，可能 ID 或 Token 不匹配。`);
-        }
-        return allEdges;
-    }
-
-    const firstConn = getConnection(firstBusiness);
-    allEdges.push(...(firstConn?.edges || []));
-
-    const totalPages = Math.min(firstConn?.pageInfo?.totalPages || 1, MAX_PAGES_PER_ACCOUNT);
-
-    console.log(`[Wave Debug] ${acc.name} (${label}) 第 1/${totalPages} 页，累计 ${allEdges.length} 条`);
-
-    let page = 2;
-    while (page <= totalPages) {
-        const batchPages = [];
-        for (let i = 0; i < FETCH_CONCURRENCY && page <= totalPages; i++, page++) {
-            batchPages.push(page);
-        }
-
-        const batchResults = await Promise.all(batchPages.map(async (p) => {
-            try {
-                const result = await graphqlRequestWithRetry(acc, label, queryString, { businessId: acc.businessId, page: p, pageSize: PAGE_SIZE, ...extraVars }, p);
-                const conn = getConnection(result.business);
-                return conn?.edges || [];
-            } catch (error) {
-                console.error(`Wave Search Error for ${acc.name} (${label}, page ${p}):`, error.response?.data || error.message);
-                return [];
-            }
-        }));
-
-        for (const edges of batchResults) {
-            allEdges.push(...edges);
-        }
-
-        console.log(`[Wave Debug] ${acc.name} (${label}) 已抓到第 ${Math.min(page - 1, totalPages)}/${totalPages} 页，累计 ${allEdges.length} 条`);
-    }
-
-    return allEdges;
-}
-
-// extraFilters 可以传 { customerId, invoiceDateStart, invoiceDateEnd } 让 Wave 直接筛，不传就是整表扫（跟以前一样）
-async function fetchAllInvoicesForAccount(acc, extraFilters = {}) {
-    return fetchAllPages(acc, 'invoices', INVOICES_QUERY, extraFilters, (business) => business?.invoices);
-}
-
-// 客户列表通常比发票少得多，缓存起来，避免每次搜索都重新拉一遍
-const customerCache = new Map(); // businessId -> { timestamp, customers: [{id, name}] }
-
-async function getCustomersForAccount(acc) {
-    const cached = customerCache.get(acc.businessId);
-    if (cached && (Date.now() - cached.timestamp) < CUSTOMER_CACHE_TTL_MS) {
-        return cached.customers;
-    }
-
-    const edges = await fetchAllPages(acc, 'customers', CUSTOMERS_QUERY, {}, (business) => business?.customers);
-    const customers = edges.map(e => e.node).filter(Boolean);
-    customerCache.set(acc.businessId, { timestamp: Date.now(), customers });
-    console.log(`[Wave Debug] ${acc.name} 客户列表已缓存，共 ${customers.length} 个客户`);
-    return customers;
-}
-
-// 把一些常见的口语化写法转成实际存在字段里的纯数字/文字，再去匹配
 function normalizeKeyword(kw) {
-    // "YE2026" -> "2026"，"YE26" -> "2026"：按年份匹配发票日期/付款日期
-    // 两位数年份一律当成 20XX（这是给 2000~2099 年用的，够用很久了）
     const yeMatch = kw.match(/^ye(\d{2}|\d{4})$/);
     if (yeMatch) {
         const digits = yeMatch[1];
         return digits.length === 2 ? `20${digits}` : digits;
     }
-
-    // "RM2720" / "RM2720.00" -> "2720" / "2720.00"：按金额匹配（金额字段本身不带 RM 字样）
     const rmMatch = kw.match(/^rm(\d+(\.\d+)?)$/);
     if (rmMatch) return rmMatch[1];
-
     return kw;
 }
 
-// 识别关键字是不是"年份 / 年-月 / 完整日期"，是的话转成 Wave 能直接筛的日期范围
 function keywordToDateRange(kw) {
-    // 完整日期，比如 2026-04-14
     if (/^\d{4}-\d{2}-\d{2}$/.test(kw)) {
         return { invoiceDateStart: kw, invoiceDateEnd: kw };
     }
-    // 年-月，比如 2026-04
     if (/^\d{4}-\d{2}$/.test(kw)) {
         const [y, m] = kw.split('-').map(Number);
-        const lastDay = new Date(y, m, 0).getDate(); // m 是 1-indexed 月份，Date(y, m, 0) 正好是该月最后一天
+        const lastDay = new Date(y, m, 0).getDate();
         return { invoiceDateStart: `${kw}-01`, invoiceDateEnd: `${kw}-${String(lastDay).padStart(2, '0')}` };
     }
-    // 整年，比如 2026（也是 "YE2026" 归一化之后的样子）
     if (/^\d{4}$/.test(kw)) {
         return { invoiceDateStart: `${kw}-01-01`, invoiceDateEnd: `${kw}-12-31` };
     }
@@ -252,7 +47,6 @@ function keywordToDateRange(kw) {
 async function searchWaveInvoice(keywordInput) {
     const keywords = keywordInput.toLowerCase().trim().split(/\s+/).filter(Boolean).map(normalizeKeyword);
 
-    // 从关键字里找一个日期范围（年 / 年-月 / 完整日期），可以让 Wave 直接按日期筛
     let dateRange = null;
     for (const kw of keywords) {
         const range = keywordToDateRange(kw);
@@ -264,9 +58,8 @@ async function searchWaveInvoice(keywordInput) {
 
     let allMatched = [];
 
-    const promises = WAVE_ACCOUNTS.map(async (acc) => {
-        // 1. 先看看关键字里有没有能对上的客户名字。命中的话直接按 customerId 筛发票，范围通常小很多
-        const customers = await getCustomersForAccount(acc);
+    const promises = wave.WAVE_ACCOUNTS.map(async (acc) => {
+        const customers = await wave.getCustomersForAccount(acc);
         const matchingCustomerIds = customers
             .filter(c => {
                 const nameLower = String(c.name || '').toLowerCase();
@@ -277,19 +70,15 @@ async function searchWaveInvoice(keywordInput) {
         let edges;
         if (matchingCustomerIds.length > 0 && matchingCustomerIds.length <= MAX_MATCHED_CUSTOMERS_FOR_FILTER) {
             const perCustomerEdges = await Promise.all(
-                matchingCustomerIds.map(cid => fetchAllInvoicesForAccount(acc, { customerId: cid, ...(dateRange || {}) }))
+                matchingCustomerIds.map(cid => wave.fetchAllInvoicesForAccount(acc, { customerId: cid, ...(dateRange || {}) }))
             );
             edges = perCustomerEdges.flat();
-            console.log(`[Wave Debug] ${acc.name} 按客户名字匹配到 ${matchingCustomerIds.length} 个客户，共抓到 ${edges.length} 张发票`);
         } else if (dateRange) {
-            edges = await fetchAllInvoicesForAccount(acc, dateRange);
-            console.log(`[Wave Debug] ${acc.name} 没匹配到客户名字，按日期范围 ${dateRange.invoiceDateStart} ~ ${dateRange.invoiceDateEnd} 筛，抓到 ${edges.length} 张发票`);
+            edges = await wave.fetchAllInvoicesForAccount(acc, dateRange);
         } else {
-            edges = await fetchAllInvoicesForAccount(acc);
-            console.log(`[Wave Debug] ${acc.name} 没有可下推的筛选条件，整表扫描，抓到 ${edges.length} 张发票`);
+            edges = await wave.fetchAllInvoicesForAccount(acc);
         }
 
-        // 2. 不管上面怎么缩小范围，最后都用完整关键字逐个比对一遍，保证结果准确（筛选只是加速，不改变对不对）
         const matched = [];
         for (let edge of edges) {
             const inv = edge.node;
@@ -301,7 +90,6 @@ async function searchWaveInvoice(keywordInput) {
             const status = String(inv.status || '').toLowerCase();
             const invoiceDate = String(inv.invoiceDate || '').toLowerCase();
 
-            // 付款记录（银行转账/信用卡等收款），一张发票可能有多笔
             const payments = inv.payments || [];
             const paymentDatesStr = payments.map(p => String(p.paymentDate || '').toLowerCase()).join(' ');
             const paymentMethodsStr = payments.map(p => String(p.paymentMethod || '').toLowerCase()).join(' ');
@@ -338,9 +126,6 @@ async function searchWaveInvoice(keywordInput) {
     return allMatched;
 }
 
-// Telegram 的 Markdown（legacy）解析器很脆弱：发票号/客户名/链接这些"动态内容"里
-// 只要出现一个没配对的 _ 或 *（比如链接里常见的下划线），整条消息就会被 Telegram 拒收报 400。
-// 改用 HTML 格式，只需要转义 & < > 三个符号，比 Markdown 稳定很多。
 function escapeHtml(str) {
     return String(str ?? '')
         .replace(/&/g, '&amp;')
@@ -348,10 +133,7 @@ function escapeHtml(str) {
         .replace(/>/g, '&gt;');
 }
 
-// Telegram 单条消息上限是 4096 字符，这里保守留一些余量，把结果切成多条消息发送
 const TELEGRAM_SAFE_LENGTH = 3500;
-// 匹配结果太多的时候（比如搜到某个客户名下几百张单），只展示前面这么多条，
-// 避免一次性刷几十条消息，并提示对方缩小搜索范围
 const MAX_RESULTS_TO_SHOW = 150;
 
 async function replyWithResults(ctx, keyword, results) {
@@ -395,13 +177,422 @@ async function replyWithResults(ctx, keyword, results) {
     }
 }
 
+// ====================================================================
+// 第二部分：新功能 —— #invoice 开票 / #edit 改票
+// 用法：
+//   上传 Excel 截图，图片的"标题/caption"里写 "#invoice SCC" 或 "#invoice SB"  → 新建发票
+//   上传 Excel 截图，caption 写 "#edit SCC 4475"                              → 更新已存在发票的项目
+// 注意：caption 要跟图片一起发送（在 Telegram 里选好图片后，在下面的文字框里输入，再一起发出去），
+// 不是先发图片、再单独发一句文字。
+//
+// 出于安全考虑，这里完全没有实现任何"删除发票"的指令 —— 不管是 Telegram 指令还是内部函数，都没有。
+// ====================================================================
+
+// 每个聊天窗口同一时间只保留一个"待确认"的操作
+const pendingActions = new Map(); // chatId -> {...}
+const PENDING_TTL_MS = 15 * 60 * 1000; // 15 分钟没确认就失效
+
+function clearStalePending(chatId) {
+    const p = pendingActions.get(chatId);
+    if (p && (Date.now() - p.createdAt) > PENDING_TTL_MS) {
+        pendingActions.delete(chatId);
+        return null;
+    }
+    return p || null;
+}
+
+// 把公司名归一化，去掉常见的后缀/标点，方便模糊匹配
+function normalizeCompanyName(name) {
+    return String(name || '')
+        .toLowerCase()
+        .replace(/\(.*?\)/g, ' ')
+        .replace(/[.,]/g, ' ')
+        .replace(/\bsdn\s*bhd\b/g, ' ')
+        .replace(/\bberhad\b/g, ' ')
+        .replace(/\bltd\b/g, ' ')
+        .replace(/\bpte\b/g, ' ')
+        .replace(/\binc\b/g, ' ')
+        .replace(/\s+/g, ' ')
+        .trim();
+}
+
+function scoreNameMatch(a, b) {
+    const na = normalizeCompanyName(a);
+    const nb = normalizeCompanyName(b);
+    if (!na || !nb) return 0;
+    if (na === nb) return 1;
+    if (na.includes(nb) || nb.includes(na)) return 0.9;
+    const ta = new Set(na.split(' ').filter(Boolean));
+    const tb = new Set(nb.split(' ').filter(Boolean));
+    let common = 0;
+    for (const t of ta) if (tb.has(t)) common++;
+    const union = new Set([...ta, ...tb]).size;
+    return union ? common / union : 0;
+}
+
+function findCustomerCandidates(customers, companyName, limit = 3) {
+    return customers
+        .map(c => ({ customer: c, score: scoreNameMatch(c.name, companyName) }))
+        .filter(x => x.score > 0.15)
+        .sort((a, b) => b.score - a.score)
+        .slice(0, limit);
+}
+
+// 把识别出来的 item 名字对到已存在的 Wave 产品/服务，对不上的标记成"待新建"
+function planProductMatches(items, existingProducts) {
+    const usedNewNames = new Map(); // 同一批里如果有两行 item 名字一样，只建一次
+    return items.map(it => {
+        const norm = String(it.item || '').trim().toLowerCase();
+        const found = existingProducts.find(p => String(p.name || '').trim().toLowerCase() === norm);
+        if (found) {
+            return { ...it, productId: found.id, isNewProduct: false };
+        }
+        if (usedNewNames.has(norm)) {
+            return { ...it, productId: usedNewNames.get(norm), isNewProduct: true, pendingCreate: true };
+        }
+        return { ...it, productId: null, isNewProduct: true, pendingCreate: true };
+    });
+}
+
+function formatItemsPreview(items) {
+    return items.map((it, idx) => {
+        const flag = it.isNewProduct ? ' 🆕新建服务项目' : '';
+        const amount = (it.qty * it.price).toFixed(2);
+        return `${idx + 1}. <b>${escapeHtml(it.item)}</b>${flag}\n   ${escapeHtml(it.description)} · 数量 ${it.qty} × RM${it.price} = RM${amount}`;
+    }).join('\n');
+}
+
+function totalOf(items) {
+    return items.reduce((sum, it) => sum + (Number(it.qty) * Number(it.price)), 0).toFixed(2);
+}
+
+// 实际创建缺失的产品，把 productId 补齐（同名的只建一次）
+async function resolveProductIds(acc, items) {
+    const created = new Map(); // normalizedName -> id
+    const resolved = [];
+    for (const it of items) {
+        if (it.productId) {
+            resolved.push(it);
+            continue;
+        }
+        const norm = String(it.item || '').trim().toLowerCase();
+        if (created.has(norm)) {
+            resolved.push({ ...it, productId: created.get(norm) });
+            continue;
+        }
+        const result = await wave.createProduct(acc, it.item);
+        const payload = result?.data?.productCreate;
+        if (!payload?.didSucceed || !payload?.product?.id) {
+            throw new Error(`新建服务项目 "${it.item}" 失败：` + JSON.stringify(payload?.inputErrors || result.errors || result));
+        }
+        created.set(norm, payload.product.id);
+        resolved.push({ ...it, productId: payload.product.id });
+    }
+    wave.invalidateProductCache(acc);
+    return resolved;
+}
+
+async function downloadTelegramPhoto(ctx) {
+    const photos = ctx.message.photo;
+    const best = photos[photos.length - 1]; // 最高分辨率
+    const fileLink = await ctx.telegram.getFileLink(best.file_id);
+    const response = await axios.get(fileLink.href, { responseType: 'arraybuffer' });
+    return Buffer.from(response.data);
+}
+
+function parseCaption(caption) {
+    if (!caption) return null;
+    const text = caption.trim();
+
+    let m = text.match(/^#invoice\s+(\S+)\s*$/i);
+    if (m) return { action: 'invoice', accountCode: m[1] };
+
+    m = text.match(/^#edit\s+(\S+)\s+(\S+)\s*$/i);
+    if (m) return { action: 'edit', accountCode: m[1], invoiceNumber: m[2] };
+
+    if (/^#invoice\b/i.test(text) || /^#edit\b/i.test(text)) {
+        return { action: 'usage_error' };
+    }
+    return null;
+}
+
+bot.on('photo', async (ctx) => {
+    const parsed = parseCaption(ctx.message.caption);
+    if (!parsed) return; // 没有 #invoice / #edit 的图片，不处理（也不影响其他功能）
+
+    if (parsed.action === 'usage_error') {
+        await ctx.reply(
+            "⚠️ 格式不对。\n" +
+            "新建发票：图片标题写 <code>#invoice SCC</code> 或 <code>#invoice SB</code>\n" +
+            "修改发票：图片标题写 <code>#edit SCC 4475</code>（账号代号 + 发票号码）\n" +
+            "记得标题要跟图片一起发出去，不要分开发。",
+            { parse_mode: 'HTML' }
+        );
+        return;
+    }
+
+    const acc = wave.findAccountByCode(parsed.accountCode);
+    if (!acc) {
+        await ctx.reply(`⚠️ 没有找到账号代号 "${escapeHtml(parsed.accountCode)}"。可用代号：` + wave.WAVE_ACCOUNTS.map(a => `${a.code} (${a.name})`).join('，'));
+        return;
+    }
+
+    const chatId = ctx.chat.id;
+
+    await ctx.reply('🔍 收到截图，正在识别内容...');
+
+    let extracted;
+    try {
+        const imageBuffer = await downloadTelegramPhoto(ctx);
+        extracted = await extractInvoiceFromImage(imageBuffer);
+    } catch (err) {
+        console.error('[Invoice] 图片识别失败:', err.response?.data || err.message);
+        await ctx.reply('❌ 图片识别失败：' + (err.message || '未知错误') + '\n换一张更清晰的截图再试一次。');
+        return;
+    }
+
+    if (!extracted.items || extracted.items.length === 0) {
+        await ctx.reply('❌ 没能从截图里认出任何一行数据，换一张更清晰的截图再试一次。');
+        return;
+    }
+
+    if (parsed.action === 'invoice') {
+        let customers;
+        try {
+            customers = await wave.getCustomersForAccount(acc);
+        } catch (err) {
+            await ctx.reply('❌ 读取 Wave 客户列表失败：' + err.message);
+            return;
+        }
+        const candidates = findCustomerCandidates(customers, extracted.companyName);
+
+        pendingActions.set(chatId, {
+            mode: 'create',
+            acc,
+            extracted,
+            candidates,
+            createdAt: Date.now()
+        });
+
+        let msg = `📋 从截图里读到的资料：\n公司名：<b>${escapeHtml(extracted.companyName)}</b>\n账号：${escapeHtml(acc.name)}\n\n`;
+        msg += '请选择这张发票要 Bill To 哪个 Wave 客户（回复数字）：\n';
+        candidates.forEach((c, idx) => {
+            msg += `${idx + 1}. ${escapeHtml(c.customer.name)}（相似度 ${(c.score * 100).toFixed(0)}%）\n`;
+        });
+        msg += `0. 都不是，新建客户 "${escapeHtml(extracted.companyName)}"\n\n回复 <code>#cancel</code> 可以取消这次操作。`;
+
+        await ctx.reply(msg, { parse_mode: 'HTML' });
+        return;
+    }
+
+    if (parsed.action === 'edit') {
+        let existingInvoice;
+        try {
+            existingInvoice = await wave.findInvoiceByNumber(acc, parsed.invoiceNumber);
+        } catch (err) {
+            await ctx.reply('❌ 查找发票失败：' + err.message);
+            return;
+        }
+        if (!existingInvoice) {
+            await ctx.reply(`❌ 在 ${acc.name} 找不到发票号码包含 "${escapeHtml(parsed.invoiceNumber)}" 的发票，确认一下号码对不对。`);
+            return;
+        }
+
+        let products;
+        try {
+            products = await wave.getProductsForAccount(acc);
+        } catch (err) {
+            await ctx.reply('❌ 读取 Wave 服务项目列表失败：' + err.message);
+            return;
+        }
+        const plannedItems = planProductMatches(extracted.items, products);
+
+        pendingActions.set(chatId, {
+            mode: 'edit',
+            acc,
+            extracted,
+            existingInvoice,
+            plannedItems,
+            createdAt: Date.now()
+        });
+
+        let msg = `📋 准备更新发票 <b>#${escapeHtml(existingInvoice.invoiceNumber)}</b>（客户：${escapeHtml(existingInvoice.customer?.name || 'N/A')}）\n\n`;
+        msg += '新的项目内容：\n' + formatItemsPreview(plannedItems) + `\n\n合计：RM${totalOf(plannedItems)}\n\n`;
+        msg += '⚠️ 确认后会用上面这些项目整个覆盖这张发票原本的项目。\n回复 <code>#confirm</code> 确认，或 <code>#cancel</code> 取消。';
+
+        await ctx.reply(msg, { parse_mode: 'HTML' });
+        return;
+    }
+});
+
+async function handleCustomerChoice(ctx, pending, choiceText) {
+    const chatId = ctx.chat.id;
+    const num = Number(choiceText.trim());
+    if (!Number.isInteger(num) || num < 0 || num > pending.candidates.length) {
+        await ctx.reply(`请回复 0 到 ${pending.candidates.length} 之间的数字，或者回复 #cancel 取消。`);
+        return;
+    }
+
+    let chosenCustomerId = null;
+    let chosenCustomerName = null;
+    if (num === 0) {
+        try {
+            const result = await wave.createCustomer(pending.acc, pending.extracted.companyName);
+            const payload = result?.data?.customerCreate;
+            if (!payload?.didSucceed || !payload?.customer?.id) {
+                await ctx.reply('❌ 新建客户失败：' + JSON.stringify(payload?.inputErrors || result.errors || result));
+                return;
+            }
+            chosenCustomerId = payload.customer.id;
+            chosenCustomerName = payload.customer.name;
+            wave.invalidateCustomerCache(pending.acc);
+        } catch (err) {
+            await ctx.reply('❌ 新建客户失败：' + err.message);
+            return;
+        }
+    } else {
+        chosenCustomerId = pending.candidates[num - 1].customer.id;
+        chosenCustomerName = pending.candidates[num - 1].customer.name;
+    }
+
+    let products;
+    try {
+        products = await wave.getProductsForAccount(pending.acc);
+    } catch (err) {
+        await ctx.reply('❌ 读取 Wave 服务项目列表失败：' + err.message);
+        return;
+    }
+    const plannedItems = planProductMatches(pending.extracted.items, products);
+
+    pendingActions.set(chatId, {
+        ...pending,
+        step: 'confirm',
+        chosenCustomerId,
+        chosenCustomerName,
+        plannedItems,
+        createdAt: Date.now()
+    });
+
+    let msg = `👤 客户：<b>${escapeHtml(chosenCustomerName)}</b>\n\n项目内容：\n${formatItemsPreview(plannedItems)}\n\n合计：RM${totalOf(plannedItems)}\n\n`;
+    msg += '发票会以"已确认但不寄出"（Saved）状态建立，不会自动 email 给客户，链接会发在这里。\n';
+    msg += '回复 <code>#confirm</code> 确认建立，或 <code>#cancel</code> 取消。';
+    await ctx.reply(msg, { parse_mode: 'HTML' });
+}
+
+async function handleConfirm(ctx, pending) {
+    const chatId = ctx.chat.id;
+
+    if (pending.mode === 'create') {
+        if (!pending.plannedItems) {
+            await ctx.reply('⚠️ 还没选客户，请先回复数字选择客户。');
+            return;
+        }
+        await ctx.reply('⏳ 正在建立发票...');
+        try {
+            const itemsWithIds = await resolveProductIds(pending.acc, pending.plannedItems);
+            const result = await wave.createInvoice(pending.acc, {
+                customerId: pending.chosenCustomerId,
+                items: itemsWithIds,
+                status: 'SAVED'
+            });
+            const payload = result?.data?.invoiceCreate;
+            if (!payload?.didSucceed || !payload?.invoice) {
+                await ctx.reply('❌ Wave 拒绝了这次建票请求，返回原始错误如下（可以直接照着改 wave.js 里的 createInvoice）：\n' +
+                    JSON.stringify(payload?.inputErrors || result.errors || result, null, 2).slice(0, 3500));
+                return;
+            }
+            await ctx.reply(
+                `✅ 发票建立成功！\n📄 发票号：#${escapeHtml(payload.invoice.invoiceNumber)}\n🔗 下载/查看链接：${escapeHtml(payload.invoice.viewUrl)}`,
+                { disable_web_page_preview: true }
+            );
+        } catch (err) {
+            console.error('[Invoice] 建票失败:', err.response?.data || err.message);
+            await ctx.reply('❌ 建票失败：' + err.message);
+        } finally {
+            pendingActions.delete(chatId);
+        }
+        return;
+    }
+
+    if (pending.mode === 'edit') {
+        await ctx.reply('⏳ 正在更新发票...');
+        try {
+            const itemsWithIds = await resolveProductIds(pending.acc, pending.plannedItems);
+            const result = await wave.patchInvoiceItems(pending.acc, pending.existingInvoice.id, itemsWithIds);
+            const payload = result?.data?.invoicePatch;
+            if (!payload?.didSucceed || !payload?.invoice) {
+                await ctx.reply('❌ Wave 拒绝了这次更新请求，返回原始错误如下（可以直接照着改 wave.js 里的 patchInvoiceItems）：\n' +
+                    JSON.stringify(payload?.inputErrors || result.errors || result, null, 2).slice(0, 3500));
+                return;
+            }
+            await ctx.reply(
+                `✅ 发票更新成功！\n📄 发票号：#${escapeHtml(payload.invoice.invoiceNumber)}\n🔗 下载/查看链接：${escapeHtml(payload.invoice.viewUrl)}`,
+                { disable_web_page_preview: true }
+            );
+        } catch (err) {
+            console.error('[Invoice] 改票失败:', err.response?.data || err.message);
+            await ctx.reply('❌ 更新失败：' + err.message);
+        } finally {
+            pendingActions.delete(chatId);
+        }
+        return;
+    }
+}
+
+// ====================================================================
+// 文字指令统一入口
+// ====================================================================
+
 bot.start((ctx) => {
-    ctx.reply("👋 Hello! Multi-Account Wave Assistant is ready.");
+    ctx.reply("👋 Hello! Multi-Account Wave Assistant is ready.\n\n" +
+        "查发票：#find <关键字>\n" +
+        "开发票：上传 Excel 截图，标题写 #invoice SCC（或 SB）\n" +
+        "改发票：上传 Excel 截图，标题写 #edit SCC <发票号码>");
 });
 
 bot.on('text', async (ctx) => {
-    const messageText = ctx.message.text;
+    const messageText = ctx.message.text.trim();
+    const chatId = ctx.chat.id;
 
+    // ---- 先看看这个聊天窗口是不是有正在等确认的开票/改票操作 ----
+    const pending = clearStalePending(chatId);
+    if (pending) {
+        if (/^#cancel$/i.test(messageText)) {
+            pendingActions.delete(chatId);
+            await ctx.reply('已取消。');
+            return;
+        }
+        if (pending.mode === 'create' && !pending.step) {
+            // 还在等客户选择
+            await handleCustomerChoice(ctx, pending, messageText);
+            return;
+        }
+        if (/^#confirm$/i.test(messageText)) {
+            await handleConfirm(ctx, pending);
+            return;
+        }
+        // 有 pending 但发来的既不是数字选择也不是 #confirm/#cancel，且不是别的指令，提示一下
+        if (!/^#(find|resend|schema)\b/i.test(messageText)) {
+            await ctx.reply('目前有一个操作在等你确认，回复 #confirm 确认、#cancel 取消，或者重新发一次截图。');
+            return;
+        }
+    }
+
+    // ---- 临时调试指令：查 Wave 某个类型的字段（正式核对完 schema 后可以删掉这段） ----
+    if (messageText.startsWith('#schema')) {
+        const parts = messageText.split(/\s+/);
+        const typeName = parts[parts.length - 1];
+        const acc = wave.WAVE_ACCOUNTS[0];
+        try {
+            const info = await wave.introspectType(acc, typeName);
+            await ctx.reply('<pre>' + escapeHtml(info) + '</pre>', { parse_mode: 'HTML' });
+        } catch (err) {
+            await ctx.reply('查询失败：' + err.message);
+        }
+        return;
+    }
+
+    // ---- 原本的查发票功能 ----
     if (messageText.startsWith('#resend') || messageText.startsWith('#find')) {
         const keyword = messageText.replace('#resend', '').replace('#find', '').trim();
 
