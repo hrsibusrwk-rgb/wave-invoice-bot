@@ -27,33 +27,42 @@ function normalizeKeyword(kw) {
     return kw;
 }
 
-function keywordToDateRange(kw) {
-    if (/^\d{4}-\d{2}-\d{2}$/.test(kw)) {
-        return { invoiceDateStart: kw, invoiceDateEnd: kw };
+// Takes the RAW keyword (before normalizeKeyword strips any "ye"/"rm" prefix) so it can tell a real
+// year apart from a bare number that's just part of a company's name.
+function keywordToDateRange(rawKw) {
+    if (/^\d{4}-\d{2}-\d{2}$/.test(rawKw)) {
+        return { invoiceDateStart: rawKw, invoiceDateEnd: rawKw };
     }
-    if (/^\d{4}-\d{2}$/.test(kw)) {
-        const [y, m] = kw.split('-').map(Number);
+    if (/^\d{4}-\d{2}$/.test(rawKw)) {
+        const [y, m] = rawKw.split('-').map(Number);
         const lastDay = new Date(y, m, 0).getDate();
-        return { invoiceDateStart: `${kw}-01`, invoiceDateEnd: `${kw}-${String(lastDay).padStart(2, '0')}` };
+        return { invoiceDateStart: `${rawKw}-01`, invoiceDateEnd: `${rawKw}-${String(lastDay).padStart(2, '0')}` };
     }
-    if (/^\d{4}$/.test(kw)) {
-        return { invoiceDateStart: `${kw}-01-01`, invoiceDateEnd: `${kw}-12-31` };
+    // Year — only when explicitly marked with "YE" (year-end), e.g. YE2023 or YE23.
+    // A bare 4-digit number on its own (e.g. "2023") is NOT treated as a year, because it can just as
+    // easily be part of a customer's actual name (e.g. a company literally called "CJ 2023") — treating
+    // it as a date would wrongly narrow the search at the API level and hide real matches.
+    const yeMatch = rawKw.match(/^ye(\d{2}|\d{4})$/);
+    if (yeMatch) {
+        const digits = yeMatch[1];
+        const year = digits.length === 2 ? `20${digits}` : digits;
+        return { invoiceDateStart: `${year}-01-01`, invoiceDateEnd: `${year}-12-31` };
     }
     return null;
 }
 
 async function searchWaveInvoice(keywordInput) {
-    const keywords = keywordInput.toLowerCase().trim().split(/\s+/).filter(Boolean).map(normalizeKeyword);
+    const rawKeywords = keywordInput.toLowerCase().trim().split(/\s+/).filter(Boolean);
+    const keywords = rawKeywords.map(normalizeKeyword);
 
     let dateRange = null;
-    for (const kw of keywords) {
-        const range = keywordToDateRange(kw);
+    for (const rawKw of rawKeywords) {
+        const range = keywordToDateRange(rawKw);
         if (range) {
             dateRange = range;
             break;
         }
     }
-
     let allMatched = [];
 
     const promises = wave.WAVE_ACCOUNTS.map(async (acc) => {
