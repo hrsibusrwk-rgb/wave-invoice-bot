@@ -324,6 +324,23 @@ async function resolveProductIds(acc, items) {
     return resolved;
 }
 
+// Parses a price/amount cell that may be:
+//   "200.00"      -> 200   (plain)
+//   "-200.00"     -> -200  (minus sign)
+//   "(200.00)"    -> -200  (accounting style — Excel's normal way of showing negatives,
+//                           and the one that was silently turning into a positive before)
+// Returns NaN if the cell doesn't contain a usable number at all.
+function parseSignedAmount(raw) {
+    const str = String(raw ?? '').trim();
+    const parenMatch = str.match(/^\((.*)\)$/);
+    if (parenMatch) {
+        const inner = parenMatch[1].replace(/[^0-9.]/g, '');
+        const num = parseFloat(inner);
+        return Number.isFinite(num) ? -Math.abs(num) : NaN;
+    }
+    return parseFloat(str.replace(/[^0-9.\-]/g, ''));
+}
+
 // Parse the pasted Excel content. Three formats are auto-detected so the user doesn't need to
 // know which one they have:
 //   1. Desktop paste: one line per row, cells separated by real tab characters.
@@ -378,7 +395,7 @@ function parseTabSeparatedPaste(lines) {
         if (!item || !qtyRaw || !priceRaw) continue;
 
         const qty = parseFloat(qtyRaw.replace(/,/g, ''));
-        const price = parseFloat(String(priceRaw).replace(/[^0-9.\-]/g, ''));
+        const price = parseSignedAmount(priceRaw);
 
         if (!Number.isFinite(qty) || !Number.isFinite(price)) continue;
 
@@ -440,7 +457,7 @@ function parseOneCellPerLinePaste(lines) {
         const item = group[0];
         const description = group[1];
         const qty = parseFloat(String(group[2]).replace(/,/g, ''));
-        const price = parseFloat(String(group[3]).replace(/[^0-9.\-]/g, ''));
+        const price = parseSignedAmount(group[3]);
 
         if (!item || !Number.isFinite(qty) || !Number.isFinite(price)) continue;
         items.push({ item, description, qty, price });
@@ -463,10 +480,11 @@ function parseSpaceColumnPaste(lines, knownItemNames) {
 
     // Greedy (.+) naturally backtracks to the rightmost point where the rest of the line is exactly
     // "QTY PRICE AMOUNT", which is what isolates the trailing numeric columns from the item/description text.
-    // Price/Amount allow a leading "-" (refunds, credit notes, discounts) — without it, a negative row
-    // simply fails this whole pattern and gets silently dropped further down (not shown as positive,
-    // just thrown away entirely), which is worse and easy to miss.
-    const rowPattern = /^(.+)\s+(-?\d+(?:\.\d+)?)\s+(-?[\d,]+(?:\.\d+)?)\s+(-?[\d,]+(?:\.\d+)?)\s*$/;
+    // The three trailing columns are matched as \S+ (any non-space run) rather than a strict numeric
+    // pattern, because Excel can format a negative price several ways — "-200.00" or accounting-style
+    // "(200.00)" — and parseSignedAmount (below) handles interpreting whichever one shows up. A column
+    // that still isn't a valid number after that gets caught by the Number.isFinite check further down.
+    const rowPattern = /^(.+)\s+(\S+)\s+(\S+)\s+(\S+)\s*$/;
 
     for (const rawLine of lines) {
         const line = rawLine.trim();
@@ -484,8 +502,8 @@ function parseSpaceColumnPaste(lines, knownItemNames) {
         if (!m) continue;
 
         const rest = m[1].trim();
-        const qty = parseFloat(m[2].replace(/,/g, ''));
-        const price = parseFloat(m[3].replace(/,/g, ''));
+        const qty = parseSignedAmount(m[2]);
+        const price = parseSignedAmount(m[3]);
 
         if (!rest || !Number.isFinite(qty) || !Number.isFinite(price)) continue;
 
