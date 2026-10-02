@@ -463,7 +463,10 @@ function parseSpaceColumnPaste(lines, knownItemNames) {
 
     // Greedy (.+) naturally backtracks to the rightmost point where the rest of the line is exactly
     // "QTY PRICE AMOUNT", which is what isolates the trailing numeric columns from the item/description text.
-    const rowPattern = /^(.+)\s+(\d+(?:\.\d+)?)\s+([\d,]+(?:\.\d+)?)\s+([\d,]+(?:\.\d+)?)\s*$/;
+    // Price/Amount allow a leading "-" (refunds, credit notes, discounts) — without it, a negative row
+    // simply fails this whole pattern and gets silently dropped further down (not shown as positive,
+    // just thrown away entirely), which is worse and easy to miss.
+    const rowPattern = /^(.+)\s+(-?\d+(?:\.\d+)?)\s+(-?[\d,]+(?:\.\d+)?)\s+(-?[\d,]+(?:\.\d+)?)\s*$/;
 
     for (const rawLine of lines) {
         const line = rawLine.trim();
